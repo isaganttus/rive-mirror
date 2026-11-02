@@ -1,0 +1,602 @@
+#!/usr/bin/env bash
+# rive-mirror: keep local copies of the Rive files you can open. Works like git: a folder
+# becomes a mirror once you run `init` in it, and every command acts on the folder you are
+# in and everything under it.
+#
+#   rive-mirror init [PATH]        make PATH (default: here) a mirror. Refuses your home folder,
+#                                  folders inside another mirror, and downloaded file folders
+#   rive-mirror init --adopt-global   also copy the old single-mirror setup (selection, seen list,
+#                                  checksums from ~/.config/rive-mirror) into this mirror
+#   rive-mirror select             tick workspaces/projects/folders to keep mirrored (this mirror's rules)
+#   rive-mirror select --list      show the rules  (--clear forgets them)
+#   rive-mirror                    download what's missing, for the rules, inside the current folder
+#                                  (flags new workspaces/projects/folders the rules don't cover;
+#                                   --no-check skips that, and it only runs from the mirror's top)
+#   rive-mirror --refresh          update already-mirrored folders from the Editor, but ONLY the
+#                                  ones with no local changes; the rest are listed and left alone
+#   rive-mirror --refresh --baseline   one-off for folders mirrored before --refresh existed:
+#                                  record them as "unchanged as of now" (pulls nothing)
+#   rive-mirror --refresh --baseline=changed   after you've pushed edited folders: record the ones
+#                                  with local changes as current again (use with --only)
+#   rive-mirror root               print the mirror you are in
+#   rive-mirror ignore [add W..|rm W|edit] [--global]   skip names containing a word (like .gitignore)
+#                                  local (this mirror) by default; --global applies to every mirror
+#   rive-mirror -C PATH ...        run as if started in PATH (like git -C)
+#
+#   --all                  ignore the saved rules for this run
+#   --only=WORD|PATH       this run only: just names matching it (repeatable), e.g.
+#                          --only=icons   or   --only='studio/main work/icons'
+#   --workspace=ID         only that workspace (repeatable; ids from `rive workspace`)
+#   --dry-run  --yes  --limit=N  --ignore=WORD  --no-ignore
+#
+# Settings: global in ~/.config/rive-mirror/ (ignore list, list of known mirrors);
+#           local in <mirror>/.rive-mirror/ (selection, seen list, checksums, Rive account,
+#           ignore list). Local adds to global.
+# Layout:   <mirror>/<workspace>-<id>/<project>/<folders...>/<file>-<fileId>/
+# A plain run only creates folders that don't exist yet. Never pushes. Only --refresh
+# pulls, and only into folders whose files still match what was downloaded.
+#
+# WARNING: each folder is linked to its Editor file via push.fileId in rive.yaml.
+# Running `rive push` inside one OVERWRITES that Editor file.
+
+set -euo pipefail
+export RIVE_NO_TUI=1
+
+GLOBAL="${XDG_CONFIG_HOME:-$HOME/.config}/rive-mirror"
+GIGN="$GLOBAL/ignore"
+SELF_DIR=$(python3 -I -c 'import os,sys;print(os.path.dirname(os.path.realpath(sys.argv[1])))' "$0")
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+norm() { local p="${1/#\~/$HOME}"; case "$p" in /*) ;; *) p="$PWD/$p" ;; esac; printf '%s' "${p%/}"; }
+
+# -C PATH / --dir=PATH: act as if started in PATH. Removed from the arguments here.
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -C) [ $# -ge 2 ] || { echo "-C needs a path" >&2; exit 2; }; cd "$(norm "$2")" || exit 2; shift ;;
+    --dir=*) cd "$(norm "${1#*=}")" || exit 2 ;;
+    *) ARGS+=("$1") ;;
+  esac
+  shift
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+
+# ---- finding the mirror: walk up from here until a .rive-mirror folder shows up ----
+find_root() {
+  local d; d=$(pwd -P)
+  while :; do
+    [ -d "$d/.rive-mirror" ] && { printf '%s' "$d"; return 0; }
+    [ "$d" = / ] && return 1
+    d=$(dirname "$d")
+  done
+}
+ROOT=""; ROOT=$(find_root) || ROOT=""
+LOCAL=""; LIGN=""; SEL_FILE=""; STAMPS=""
+set_paths() {
+  LOCAL="$ROOT/.rive-mirror"; LIGN="$LOCAL/ignore"; SEL_FILE="$LOCAL/selection"; STAMPS="$LOCAL/stamps"
+  export RIVE_MIRROR_LOCAL="$LOCAL"
+}
+[ -z "$ROOT" ] || set_paths
+
+# check_account: stop if the signed-in Rive account isn't the one this mirror belongs to;
+# a mirror with no account yet is bound to the signed-in one.
+check_account() {
+  local who me want
+  who=$(rive whoami 2>/dev/null) || { echo "not signed in: run 'rive login'" >&2; exit 3; }
+  me=$(printf '%s\n' "$who" | awk 'NR==1{print $1}')
+  if [ -f "$LOCAL/account" ]; then
+    want=$(head -n 1 "$LOCAL/account")
+    if [ -n "$me" ] && [ "$want" != "$me" ]; then
+      echo "This mirror belongs to Rive account '$want' but you are signed in as '$me'." >&2
+      echo "  Sign in as '$want' (rive logout; rive login), or run rive-mirror in the mirror for '$me'." >&2
+      echo "  (To rebind this mirror to '$me', delete $LOCAL/account.)" >&2
+      exit 3
+    fi
+  elif [ -n "$me" ]; then printf '%s\n' "$me" > "$LOCAL/account"; echo "(this mirror is now bound to Rive account '$me')" >&2; fi
+}
+
+# do_init PATH: create PATH/.rive-mirror. Returns 1 when it won't.
+do_init() {
+  local p="$1" r d acct
+  [ -d "$p" ] || { echo "no such folder: $p" >&2; return 1; }
+  p=$(cd "$p" && pwd -P)
+  if [ "$p" = "$HOME" ] || [ "$p" = / ]; then
+    echo "Not creating a mirror in $p. Make a dedicated folder for it first." >&2; return 1
+  fi
+  if r=$(cd "$p" && find_root); then
+    if [ "$r" = "$p" ]; then echo "already a mirror: $p"; return 0; fi
+    echo "$p is inside the mirror at $r; mirrors can't be nested." >&2; return 1
+  fi
+  d="$p"
+  while :; do
+    if [ -f "$d/rive.yaml" ]; then echo "$p is inside a downloaded file folder ($d); pick a folder above it." >&2; return 1; fi
+    [ "$d" = / ] && break; d=$(dirname "$d")
+  done
+  mkdir -p "$p/.rive-mirror/stamps"; printf '*\n' > "$p/.rive-mirror/.gitignore"
+  acct=$(rive whoami 2>/dev/null | awk 'NR==1{print $1}') || acct=""
+  [ -z "$acct" ] || printf '%s\n' "$acct" > "$p/.rive-mirror/account"
+  mkdir -p "$GLOBAL"; grep -qxF -- "$p" "$GLOBAL/roots" 2>/dev/null || printf '%s\n' "$p" >> "$GLOBAL/roots"
+  echo "created a mirror in $p${acct:+ (Rive account: $acct)}"
+  echo "next: rive-mirror select"
+}
+
+# need_root: commands that need a mirror. In a terminal it offers to create one right here.
+need_root() {
+  [ -z "$ROOT" ] || return 0
+  echo "Not inside a rive-mirror folder (looked in $PWD and its parents)." >&2
+  if [ -f "$GLOBAL/roots" ]; then
+    local r any=0
+    while IFS= read -r r; do
+      [ -d "$r/.rive-mirror" ] || continue
+      [ $any = 1 ] || echo "Mirrors on this machine:" >&2; any=1; echo "  $r" >&2
+    done < "$GLOBAL/roots"
+  fi
+  if [ -f "$GLOBAL/dir" ]; then
+    echo "Your old single-folder setup pointed at: $(head -n 1 "$GLOBAL/dir")" >&2
+    echo "  carry it over with:  cd \"$(head -n 1 "$GLOBAL/dir")\" && rive-mirror init --adopt-global" >&2
+  fi
+  if [ -t 0 ] && [ -t 1 ]; then
+    printf 'Create a mirror in %s? [y/N] ' "$PWD" >&2; read -r a
+    [ "$a" = y ] || exit 2
+    command -v rive >/dev/null || { echo "rive not found on PATH" >&2; exit 1; }
+    do_init "$PWD" >&2 || exit 2
+    ROOT=$(find_root); set_paths
+  else
+    echo "Run 'rive-mirror init' in the folder you want to use." >&2; exit 2
+  fi
+}
+
+# rive-mirror init [PATH] [--adopt-global]
+if [ "${1:-}" = init ]; then
+  command -v rive >/dev/null || { echo "rive not found on PATH" >&2; exit 1; }
+  target="$PWD"; adopt=0
+  for a in "${@:2}"; do case "$a" in --adopt-global) adopt=1 ;; *) target=$(norm "$a") ;; esac; done
+  do_init "$target" || exit 2
+  if [ "$adopt" = 1 ]; then
+    L="$(cd "$target" && pwd -P)/.rive-mirror"
+    if [ -f "$GLOBAL/dir" ] && [ "$(head -n 1 "$GLOBAL/dir")" != "$(cd "$target" && pwd -P)" ]; then
+      echo "note: the old setup was for $(head -n 1 "$GLOBAL/dir"), not this folder"
+    fi
+    for f in selection known; do
+      if [ ! -f "$GLOBAL/$f" ]; then continue
+      elif [ -f "$L/$f" ]; then echo "kept existing $f"
+      else cp "$GLOBAL/$f" "$L/$f"; echo "copied $f"; fi
+    done
+    if [ -d "$GLOBAL/stamps" ] && [ -n "$(ls -A "$GLOBAL/stamps" 2>/dev/null)" ]; then cp -n "$GLOBAL"/stamps/* "$L/stamps/"; echo "copied checksums"; fi
+    echo "(the global ignore list stays global; the old files in $GLOBAL were copied, not moved)"
+  fi
+  exit 0
+fi
+
+# rive-mirror root | dir
+if [ "${1:-}" = root ] || [ "${1:-}" = dir ]; then
+  if [ "${2:-}" != "" ]; then echo "there is no saved directory any more; use 'rive-mirror init PATH'." >&2; exit 2; fi
+  if [ -n "$ROOT" ]; then echo "$ROOT"; else echo "not inside a rive-mirror folder" >&2; exit 1; fi
+  exit 0
+fi
+
+# rive-mirror select [--list|--clear]: the multiselect browser (see rive-mirror-select.py).
+if [ "${1:-}" = select ]; then
+  command -v rive >/dev/null || { echo "rive not found on PATH" >&2; exit 1; }
+  need_root
+  case "${2:-}" in --list|--clear) ;; *) check_account ;; esac
+  exec python3 -I "$SELF_DIR/rive-mirror-select.py" "${@:2}"
+fi
+
+# rive-mirror ignore [add WORD... | rm WORD | edit] [--global]
+if [ "${1:-}" = ignore ]; then
+  rest=(); G=0
+  for a in "${@:2}"; do if [ "$a" = --global ]; then G=1; else rest+=("$a"); fi; done
+  set -- ignore ${rest[@]+"${rest[@]}"}
+  show_ign() { printf '%s\n' "# rive-mirror ignore list. One pattern per line, case-insensitive, # for comments." \
+      "# word          skips any workspace, project, folder or file whose name contains it" \
+      "# wild*card     with * ? [..] the pattern must match the whole name" \
+      "# a/b          with a slash, matched against the whole path: workspace/project/folder/file"; }
+  if [ "$G" = 1 ]; then TGT="$GIGN"; WHICH="global"
+  elif [ -n "$ROOT" ]; then TGT="$LIGN"; WHICH="this mirror"
+  elif [ "${2:-}" = "" ]; then TGT=""; WHICH=""
+  else echo "Not inside a mirror. Use --global to change the list shared by every mirror." >&2; exit 2; fi
+  if [ -n "$TGT" ] && [ ! -f "$TGT" ]; then mkdir -p "$(dirname "$TGT")"; show_ign > "$TGT"; fi
+  case "${2:-}" in
+    "") echo "global ($GIGN):"; { [ -f "$GIGN" ] && grep -vE '^\s*(#|$)' "$GIGN"; } | sed 's/^/  /' || true
+        if [ -n "$ROOT" ]; then echo "this mirror ($LIGN):"; { [ -f "$LIGN" ] && grep -vE '^\s*(#|$)' "$LIGN"; } | sed 's/^/  /' || true
+        else echo "(not inside a mirror: showing only the global list)"; fi
+        echo "(add one with: rive-mirror ignore add WORD   or   --global)" ;;
+    add) shift 2; [ $# -gt 0 ] || { echo "usage: rive-mirror ignore add WORD... [--global]" >&2; exit 2; }
+         for w in "$@"; do
+           if grep -qixF -- "$w" "$TGT"; then echo "already ignored ($WHICH): $w"; else printf '%s\n' "$w" >> "$TGT"; echo "ignoring ($WHICH): $w"; fi
+         done
+         echo "(already-mirrored folders are not deleted)" ;;
+    rm)  [ -n "${3:-}" ] || { echo "usage: rive-mirror ignore rm WORD [--global]" >&2; exit 2; }
+         if grep -qixF -- "$3" "$TGT"; then grep -vixF -- "$3" "$TGT" > "$TGT.tmp" || true; mv "$TGT.tmp" "$TGT"; echo "removed ($WHICH): $3"
+         else echo "not in the $WHICH list: $3" >&2; exit 1; fi ;;
+    edit) ${EDITOR:-vi} "$TGT" ;;
+    *) echo "usage: rive-mirror ignore [add WORD... | rm WORD | edit] [--global]" >&2; exit 2 ;;
+  esac
+  exit 0
+fi
+
+ORIG_ARGS=("$@")
+REFRESH=0; BASELINE=0
+DRY=0; YES=0; ALL=0; EVERYTHING=0; NOCHECK=0; LIMIT=0; ONLY=" "; NOIGN=0; CLI_PATTERNS=""; ONLY_RAW=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY=1 ;;
+    --yes|-y) YES=1 ;;
+    --all) ALL=1; EVERYTHING=1 ;;
+    --workspace=*) ONLY="$ONLY${1#*=} " ;;
+    --limit=*) LIMIT="${1#*=}" ;;
+    --ignore=*) CLI_PATTERNS="$CLI_PATTERNS${1#*=}"$'\n' ;;
+    --no-ignore) NOIGN=1 ;;
+    --no-check) NOCHECK=1 ;;
+    --refresh) REFRESH=1 ;;
+    --baseline) BASELINE=1 ;;
+    --baseline=changed) BASELINE=2 ;;
+    --only=*) ONLY_RAW="$ONLY_RAW${1#*=}"$'\n'; ALL=1 ;;
+    -h|--help) awk 'NR>1 && /^#/{print; next} NR>1{exit}' "$0"; exit 0 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+[ "$BASELINE" = 0 ] || [ "$REFRESH" = 1 ] || { echo "--baseline goes with --refresh" >&2; exit 2; }
+
+need_root
+
+# Where are we inside the mirror? Everything below works on this folder and what is under it.
+# Inside a downloaded file folder (or below one), the scope is that file's folder.
+SCOPE_ABS=""; SCOPE_WS=""; SCOPE_PROJ=""; SCOPE_NOTE=""
+PWDP=$(pwd -P)
+if [ "$PWDP" != "$ROOT" ]; then
+  d="$PWDP"; while [ "$d" != "$ROOT" ] && [ "$d" != / ]; do
+    [ -f "$d/rive.yaml" ] && { PWDP="$d"; break; }; d=$(dirname "$d")
+  done
+  rel="${PWDP#"$ROOT"/}"; first="${rel%%/*}"
+  wsid=$(printf '%s' "$first" | sed -nE 's/.*-([0-9]+)$/\1/p')
+  [ -n "$wsid" ] || { echo "This folder is not inside a workspace folder (<name>-<id>) of the mirror at $ROOT" >&2; exit 2; }
+  [ "$ONLY" = " " ] || { echo "--workspace can't be combined with running inside a workspace folder" >&2; exit 2; }
+  SCOPE_WS="$wsid"
+  SCOPE_ABS=$(lower "$PWDP")
+  case "$rel" in */*) rest="${rel#*/}"; SCOPE_PROJ="${rest%%/*}" ;; esac
+  SCOPE_PROJ=$(lower "$SCOPE_PROJ"); SCOPE_NOTE="$rel"
+fi
+in_scope() {
+  [ -n "$SCOPE_ABS" ] || return 0
+  local d; d=$(lower "$1"); [ "$d" = "$SCOPE_ABS" ] || [ "${d#"$SCOPE_ABS"/}" != "$d" ]
+}
+
+command -v rive >/dev/null || { echo "rive not found on PATH" >&2; exit 1; }
+command -v jq   >/dev/null || { echo "jq not found (brew install jq)" >&2; exit 1; }
+check_account
+[ -z "$SCOPE_NOTE" ] || echo "Working in $SCOPE_NOTE (run from the mirror's top folder for everything)"
+
+# Saved selection (from `rive-mirror select`) is used unless this run says otherwise.
+USE_SEL=0
+if [ "$ONLY" = " " ] && [ -z "$ONLY_RAW" ] && [ "$EVERYTHING" = 0 ]; then
+  if [ ! -s "$SEL_FILE" ] && [ -t 0 ] && [ -t 1 ]; then
+    echo "No selection saved yet; opening the selector."
+    python3 -I "$SELF_DIR/rive-mirror-select.py" || exit 0
+  fi
+  [ -s "$SEL_FILE" ] && USE_SEL=1
+fi
+
+# ---- change tracking for --refresh ----
+# After a download or refresh, a checksum of the folder's files is saved under the config dir
+# (stamps/<fileId>). A folder is "unchanged" while its checksum still matches the saved one.
+# Stamps live in the mirror's .rive-mirror folder, not in the projects, so nothing extra gets pushed.
+folder_sum() {
+  ( cd "$1" && LC_ALL=C find . -type f -not -path './.git/*' -not -name .DS_Store -print0 | LC_ALL=C sort -z |
+    xargs -0 shasum -a 256 2>/dev/null | shasum -a 256 | cut -d' ' -f1 )
+}
+stamp_set() { mkdir -p "$STAMPS"; folder_sum "$2" > "$STAMPS/$1"; }
+
+# ---- ignore patterns (case-insensitive): global list + this mirror's list + --ignore ----
+PATTERNS=()
+if [ "$NOIGN" = 0 ]; then
+  while IFS= read -r line; do
+    line="${line%%#*}"; line=$(printf '%s' "$line" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')
+    [ -n "$line" ] && PATTERNS+=("$(lower "$line")")
+  done < <( { [ -f "$GIGN" ] && cat "$GIGN"; [ -f "$LIGN" ] && cat "$LIGN"; printf '%s' "$CLI_PATTERNS"; } || true )
+fi
+
+# ---- --only (include list for this run) ----
+ONLYP=()
+while IFS= read -r line; do
+  line=$(printf '%s' "$line" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')
+  [ -n "$line" ] && ONLYP+=("$(lower "$line")")
+done < <(printf '%s' "$ONLY_RAW")
+
+# only_match WS/PROJECT/FOLDER/.../FILE: true if there is no --only, or one matches.
+#   word        substring of the path        (case-insensitive)
+#   wild*card   must match a whole name
+#   a/b/c       a path from the workspace down: workspace/project/folder...
+only_match() {
+  [ ${#ONLYP[@]} -eq 0 ] && return 0
+  local s g p; s=$(lower "$1"); local segs; IFS='/' read -ra segs <<< "$s"
+  for p in "${ONLYP[@]}"; do
+    case "$p" in
+      */*) case "$s" in $p|$p/*) return 0 ;; esac ;;
+      *[\*\?\[]*) for g in "${segs[@]}"; do case "$g" in $p) return 0 ;; esac; done ;;
+      *) case "$s" in *"$p"*) return 0 ;; esac ;;
+    esac
+  done
+  return 1
+}
+
+# only_possible NAME...: could anything under these workspace/project names still match?
+# Lets path-style --only skip whole workspaces and projects without listing them.
+# A word or wildcard could match deeper down, so those never prune.
+only_possible() {
+  [ ${#ONLYP[@]} -eq 0 ] && return 0
+  local p k i ok ps
+  for p in "${ONLYP[@]}"; do
+    case "$p" in */*) ;; *) return 0 ;; esac
+    IFS='/' read -ra ps <<< "$p"; ok=1; i=0
+    for k in "$@"; do
+      [ $i -lt ${#ps[@]} ] || break
+      case "$(lower "$k")" in ${ps[$i]}) ;; *) ok=0; break ;; esac
+      i=$((i+1))
+    done
+    [ $ok = 1 ] && return 0
+  done
+  return 1
+}
+
+# ---- saved selection ----
+# Rules from `rive-mirror select`: a workspace id, a lowercase path, and + (include) or - (exclude).
+# The most specific (longest) matching path wins, so "+ studio" with "- studio/old" keeps
+# everything in studio except old.
+SEL_W=(); SEL_P=(); SEL_S=()
+if [ "$USE_SEL" = 1 ]; then
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    SEL_W+=("$(printf '%s' "$line" | cut -f1)")
+    SEL_P+=("$(lower "$(printf '%s' "$line" | cut -f3)")")
+    sign=$(printf '%s' "$line" | cut -f4); [ "$sign" = "-" ] || sign="+"
+    SEL_S+=("$sign")
+  done < "$SEL_FILE"
+  echo "Using your saved selection (${#SEL_W[@]} rules). Change: rive-mirror select   Everything: --all"
+fi
+# sel_match WID PATH: is this path included? (PATH = project/folder/.../file, any case)
+sel_match() {
+  local i p s best=-1 sign="-"; s=$(lower "$2")
+  for ((i=0; i<${#SEL_W[@]}; i++)); do
+    [ "${SEL_W[$i]}" = "$1" ] || continue
+    p="${SEL_P[$i]}"
+    if [ -z "$p" ] || [ "$s" = "$p" ] || [ "${s#"$p"/}" != "$s" ]; then
+      if [ ${#p} -gt $best ]; then best=${#p}; sign="${SEL_S[$i]}"; fi
+    fi
+  done
+  [ "$sign" = "+" ] && [ $best -ge 0 ]
+}
+# Could anything in this workspace/project be included? Used to skip listing it.
+sel_ws_possible() {
+  local i; for ((i=0; i<${#SEL_W[@]}; i++)); do
+    [ "${SEL_W[$i]}" = "$1" ] && [ "${SEL_S[$i]}" = "+" ] && return 0
+  done; return 1
+}
+sel_proj_possible() {   # wid project-name
+  local i s; s=$(lower "$2")
+  sel_match "$1" "$2" && return 0
+  for ((i=0; i<${#SEL_W[@]}; i++)); do
+    [ "${SEL_W[$i]}" = "$1" ] && [ "${SEL_S[$i]}" = "+" ] || continue
+    [ "${SEL_P[$i]#"$s"/}" != "${SEL_P[$i]}" ] && return 0
+  done
+  return 1
+}
+
+# ignored NAME: does a single workspace/project/folder/file name match?
+ignored() {
+  local s p; s=$(lower "$1")
+  for p in ${PATTERNS[@]+"${PATTERNS[@]}"}; do
+    case "$p" in
+      */*) continue ;;
+      *[\*\?\[]*) case "$s" in $p) return 0 ;; esac ;;
+      *) case "$s" in *"$p"*) return 0 ;; esac ;;
+    esac
+  done
+  return 1
+}
+# ignored_path A/B/C: patterns that contain a slash, matched against the whole path.
+ignored_path() {
+  local s p; s=$(lower "$1")
+  for p in ${PATTERNS[@]+"${PATTERNS[@]}"}; do
+    case "$p" in
+      */*) case "$s" in $p|$p/*|*/$p|*/$p/*) return 0 ;; esac ;;
+    esac
+  done
+  return 1
+}
+
+slug() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g'; }
+
+# `rive workspace <id>` changes a saved setting, so put it back when we're done.
+ORIG_WS=$(rive workspace --json | jq -r 'select(.current) | .workspaceId')
+CUR_WS="$ORIG_WS"
+restore() { [ "$CUR_WS" = "$ORIG_WS" ] || rive workspace "$ORIG_WS" >/dev/null 2>&1 || true; }
+trap restore EXIT
+
+# One run at a time per mirror: `rive workspace` is a global setting this script switches.
+HAVE_LOCK=""; LOCKD="$LOCAL/lock"
+unlock() { [ -z "$HAVE_LOCK" ] || rm -rf "$LOCKD"; HAVE_LOCK=""; }
+TMP=$(mktemp -d); trap 'restore; unlock; rm -rf "$TMP"' EXIT
+if [ "$DRY" = 0 ]; then
+  if ! mkdir "$LOCKD" 2>/dev/null; then
+    pid=$(cat "$LOCKD/pid" 2>/dev/null || true)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      echo "another rive-mirror (pid $pid) is running in this mirror; wait for it to finish." >&2; exit 4
+    fi
+    rm -rf "$LOCKD"; mkdir "$LOCKD"
+  fi
+  echo $$ > "$LOCKD/pid"; HAVE_LOCK=1
+fi
+PLAN="$TMP/plan.tsv"; : > "$PLAN"
+
+# 1. Build the plan: one TSV row per file.
+rive workspace --json | jq -r 'select(.kind=="workspace") | [.workspaceId, .name] | @tsv' |
+while IFS=$'\t' read -r wid wname; do
+  [ "$ONLY" = " " ] || case "$ONLY" in *" $wid "*) ;; *) continue ;; esac
+  [ -z "$SCOPE_WS" ] || [ "$wid" = "$SCOPE_WS" ] || continue
+  if ignored "$wname"; then printf 'workspace\t%s\n' "$wname" >> "$TMP/skipped.tsv"; continue; fi
+  only_possible "$wname" || continue
+  [ "$USE_SEL" = 0 ] || sel_ws_possible "$wid" || continue
+  if [ "$CUR_WS" != "$wid" ]; then rive workspace "$wid" >/dev/null; CUR_WS="$wid"; fi
+  rive ls --workspace="$wid" --json | jq -r 'select(.kind=="project") | [.projectId, .name] | @tsv' |
+  while IFS=$'\t' read -r pid pname; do
+    [ -z "$SCOPE_PROJ" ] || [ "$(slug "$pname")" = "$SCOPE_PROJ" ] || continue
+    if ignored "$pname"; then printf 'project\t%s\n' "$pname" >> "$TMP/skipped.tsv"; continue; fi
+    only_possible "$wname" "$pname" || continue
+    [ "$USE_SEL" = 0 ] || sel_proj_possible "$wid" "$pname" || continue
+    rive ls "$pid" --all --workspace="$wid" --json |
+      jq -r --arg w "$wid" --arg wn "$wname" --arg pn "$pname" \
+        'select(.kind=="file") | [$w, $wn, $pn, .fileId, ((.path // "") | if . == "" then "." else . end), .name] | @tsv'
+  done
+done >> "$PLAN" || true
+# the loops run in a subshell, so recover the workspace we ended on
+CUR_WS=$(rive workspace --json | jq -r 'select(.current) | .workspaceId')
+
+# 1b. Anything new since you made the selection? Flags what the rules don't cover and lets
+#     you add it. If the selection changes, start over so the new rules are applied.
+if [ "$USE_SEL" = 1 ] && [ "$NOCHECK" = 0 ] && [ "$REFRESH" = 0 ] && [ -z "$SCOPE_ABS" ]; then
+  printf '%s\n' ${PATTERNS[@]+"${PATTERNS[@]}"} > "$TMP/patterns.txt"
+  rc=0
+  python3 -I "$SELF_DIR/rive-mirror-select.py" --check "$PLAN" --patterns "$TMP/patterns.txt" \
+    $([ "$DRY" = 1 ] && echo --report-only) || rc=$?
+  if [ "$rc" = 10 ]; then
+    restore; unlock; rm -rf "$TMP"
+    exec "$0" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
+  fi
+fi
+
+# 2. Which fileIds do we already have? (push.fileId only, not library entries)
+find "$ROOT" -name rive.yaml -not -path '*/.libraries/*' 2>/dev/null |
+  xargs -I{} awk '/^push:/{p=1;next} /^[^ ]/{p=0} p && /fileId:/{print $2 "\t" FILENAME}' {} 2>/dev/null |
+  sort -u > "$TMP/have.tsv" || true
+cut -f1 "$TMP/have.tsv" | sort -u > "$TMP/have.txt"
+
+target_dir() {   # wname wid pname fpath fname fid
+  local d="$ROOT/$(slug "$1")-$2/$(slug "$3")" s segs
+  if [ -n "$4" ]; then IFS='/' read -ra segs <<< "$4"; for s in "${segs[@]}"; do d="$d/$(slug "$s")"; done; fi
+  printf '%s' "$d/$(slug "$5")-$6"
+}
+
+TODO="$TMP/todo.tsv"; : > "$TODO"; REF="$TMP/refresh.tsv"; : > "$REF"; total=0; have=0; nign=0; nonly=0
+while IFS=$'\t' read -r wid wname pname fid fpath fname; do
+  [ "$fpath" = . ] && fpath=""   # "." stands in for "no folder" (tabs would collapse an empty field)
+  if [ -n "$SCOPE_ABS" ]; then   # inside a subfolder: only files that live under it
+    adir=$(awk -F'\t' -v f="$fid" '$1==f{print $2; exit}' "$TMP/have.tsv" | sed 's|/rive.yaml$||')
+    [ -n "$adir" ] || adir=$(target_dir "$wname" "$wid" "$pname" "$fpath" "$fname" "$fid")
+    in_scope "$adir" || continue
+  fi
+  total=$((total+1))
+  if ! only_match "$wname/$pname/${fpath:+$fpath/}$fname"; then nonly=$((nonly+1)); continue; fi
+  if [ "$USE_SEL" = 1 ] && ! sel_match "$wid" "$pname/${fpath:+$fpath/}$fname"; then continue; fi
+  skip=0
+  if ignored "$fname" || ignored_path "$wname/$pname/${fpath:+$fpath/}$fname"; then skip=1
+  elif [ -n "$fpath" ]; then
+    IFS='/' read -ra segs <<< "$fpath"
+    for s in "${segs[@]}"; do if ignored "$s"; then skip=1; break; fi; done
+  fi
+  if [ "$skip" = 1 ]; then nign=$((nign+1)); printf 'file\t%s\n' "${fpath:+$fpath/}$fname" >> "$TMP/skipped.tsv"; continue; fi
+  if grep -qx "$fid" "$TMP/have.txt"; then
+    have=$((have+1))
+    [ "$REFRESH" = 0 ] || printf '%s\t%s\t%s\n' "$fid" "$(awk -F'\t' -v f="$fid" '$1==f{print $2; exit}' "$TMP/have.tsv" | sed 's|/rive.yaml$||')" "$wid" >> "$REF"
+    continue
+  fi
+  printf '%s\t%s\t%s\n' "$fid" "$(target_dir "$wname" "$wid" "$pname" "$fpath" "$fname" "$fid")" "$wid" >> "$TODO"
+done < "$PLAN"
+
+# ---- --refresh: pull the Editor version into folders that have no local changes ----
+if [ "$REFRESH" = 1 ]; then
+  CLEAN="$TMP/clean.tsv"; NOBASE="$TMP/nobase.tsv"; CHANGED="$TMP/changed.txt"; : > "$CLEAN"; : > "$NOBASE"; : > "$CHANGED"
+  while IFS=$'\t' read -r fid dir wid; do
+    [ -d "$dir" ] || continue
+    if [ ! -f "$STAMPS/$fid" ]; then printf '%s\t%s\t%s\n' "$fid" "$dir" "$wid" >> "$NOBASE"
+    elif [ "$(folder_sum "$dir")" = "$(cat "$STAMPS/$fid")" ]; then printf '%s\t%s\t%s\n' "$fid" "$dir" "$wid" >> "$CLEAN"
+    else printf '%s\t%s\t%s\n' "$fid" "$dir" "$wid" >> "$CHANGED"; fi
+  done < "$REF"
+  nclean=$(wc -l < "$CLEAN" | tr -d ' '); nbase=$(wc -l < "$NOBASE" | tr -d ' '); nchg=$(wc -l < "$CHANGED" | tr -d ' ')
+  echo "$((nclean+nbase+nchg)) mirrored folders in scope: $nclean unchanged, $nchg with local changes, $nbase with no baseline yet"
+
+  if [ "$BASELINE" != 0 ]; then
+    SRC="$NOBASE"; nsrc=$nbase; what="no baseline"
+    [ "$BASELINE" = 1 ] || { SRC="$CHANGED"; nsrc=$nchg; what="local changes"; }
+    [ "$nsrc" -gt 0 ] || { echo "no folders with $what in scope; nothing to record"; exit 0; }
+    if [ "$DRY" = 1 ]; then cut -f2 "$SRC" | sed "s|^$ROOT/||"; exit 0; fi
+    if [ "$YES" = 0 ]; then
+      [ -t 0 ] || { echo "no terminal to confirm on; pass --yes" >&2; exit 1; }
+      echo "This records the $nsrc folders ($what) as they are NOW as 'unchanged'. Anything in them"
+      echo "that isn't pushed (or that you want to keep) will be overwritten by a later --refresh."
+      printf 'Record them? [y/N] '; read -r a; [ "$a" = y ] || exit 0
+    fi
+    while IFS=$'\t' read -r fid dir wid; do stamp_set "$fid" "$dir"; done < "$SRC"
+    echo "recorded $nsrc folders. Now: rive-mirror --refresh"
+    exit 0
+  fi
+
+  if [ "$nchg" -gt 0 ]; then
+    echo "Skipped, local changes. After you push them, record them as current with:"
+    echo "  rive-mirror --refresh --baseline=changed --only=<name>"
+    head -n 20 "$CHANGED" | cut -f2 | sed "s|^$ROOT/|  |"; [ "$nchg" -le 20 ] || echo "  ...and $((nchg-20)) more"
+  fi
+  if [ "$nbase" -gt 0 ]; then
+    echo "Skipped, downloaded before --refresh existed, so I can't tell if you edited them."
+    echo "  If you haven't, record them once with:  rive-mirror --refresh --baseline"
+    head -n 5 "$NOBASE" | cut -f2 | sed "s|^$ROOT/|  |"; [ "$nbase" -le 5 ] || echo "  ...and $((nbase-5)) more"
+  fi
+  [ "$LIMIT" -gt 0 ] && { head -n "$LIMIT" "$CLEAN" > "$CLEAN.l"; mv "$CLEAN.l" "$CLEAN"; nclean=$(wc -l < "$CLEAN" | tr -d ' '); echo "(limited to $nclean)"; }
+  [ "$nclean" -gt 0 ] || { echo "nothing to pull"; exit 0; }
+  if [ "$DRY" = 1 ]; then echo "Would pull:"; cut -f2 "$CLEAN" | sed "s|^$ROOT/|  |"; exit 0; fi
+  if [ "$YES" = 0 ]; then
+    [ -t 0 ] || { echo "no terminal to confirm on; pass --yes" >&2; exit 1; }
+    echo "The Editor version wins: pull replaces scene, scripts and assets in these folders."
+    printf 'Pull %s folders (~4s each)? [y/N] ' "$nclean"; read -r a; [ "$a" = y ] || exit 0
+  fi
+  i=0; upd=0; same=0; failed=0
+  while IFS=$'\t' read -r fid dir wid; do
+    i=$((i+1)); printf '[%s/%s] %s ' "$i" "$nclean" "${dir#$ROOT/}"
+    if [ "$CUR_WS" != "$wid" ]; then rive workspace "$wid" >/dev/null; CUR_WS="$wid"; fi
+    before=$(folder_sum "$dir")
+    if rive pull "$dir" --yes --quiet >"$TMP/out.log" 2>&1; then
+      stamp_set "$fid" "$dir"
+      if [ "$(cat "$STAMPS/$fid")" = "$before" ]; then same=$((same+1)); echo "(same)"; else upd=$((upd+1)); echo "(updated)"; fi
+    else
+      failed=$((failed+1)); echo "FAILED: $(tail -1 "$TMP/out.log")"
+    fi
+  done < "$CLEAN"
+  echo "done: $upd updated, $same already current, $failed failed"
+  [ "$failed" = 0 ] || echo "(failed folders keep their old baseline; if pull wrote part of them they will show as changed)"
+  exit 0
+fi
+
+n=$(wc -l < "$TODO" | tr -d ' ')
+echo "$total files visible, $have already mirrored, $n to download into $ROOT"
+[ ${#ONLYP[@]} -eq 0 ] || echo "--only: $total files in the projects checked, $((total-nonly)) match (others are left alone)"
+if [ -s "$TMP/skipped.tsv" ]; then
+  echo "ignored by your ignore list: $(grep -c '^workspace' "$TMP/skipped.tsv" || true) workspaces, $(grep -c '^project' "$TMP/skipped.tsv" || true) projects, $nign files (see: rive-mirror ignore)"
+fi
+[ "$LIMIT" -gt 0 ] && { head -n "$LIMIT" "$TODO" > "$TODO.l"; mv "$TODO.l" "$TODO"; n=$(wc -l < "$TODO" | tr -d ' '); echo "(limited to $n)"; }
+
+if [ "$DRY" = 1 ]; then cut -f2 "$TODO" | sed "s|^$ROOT/||"; exit 0; fi
+[ "$n" -gt 0 ] || exit 0
+
+if [ "$YES" = 0 ]; then
+  [ -t 0 ] || { echo "no terminal to confirm on; pass --yes" >&2; exit 1; }
+  printf 'Download %s files (~4s each)? [y/N] ' "$n"; read -r a; [ "$a" = y ] || exit 0
+fi
+
+# 3. Download.
+i=0; failed=0
+while IFS=$'\t' read -r fid dir wid; do
+  i=$((i+1)); echo "[$i/$n] ${dir#$ROOT/}"
+  if [ "$CUR_WS" != "$wid" ]; then rive workspace "$wid" >/dev/null; CUR_WS="$wid"; fi
+  mkdir -p "$(dirname "$dir")"
+  if ! rive create "$dir" --from-remote-file="$fid" >"$TMP/out.log" 2>&1; then
+    failed=$((failed+1)); echo "   FAILED: $(tail -1 "$TMP/out.log")"; rm -rf "$dir"
+  else
+    stamp_set "$fid" "$dir"
+  fi
+done < "$TODO"
+
+echo "done: $((n-failed)) downloaded, $failed failed"
+echo "Reminder: 'rive push' inside any of these folders overwrites its Editor file."
