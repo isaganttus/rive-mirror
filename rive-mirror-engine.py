@@ -15,11 +15,26 @@ Change tracking
   state STAMPS < rows          rows are "fid TAB dir TAB wid"; prints
                                "state TAB fid TAB dir TAB wid" with state one of
                                clean | changed | nobase | missing
+
+Listing your account
+  The account is listed in parallel and the answers are kept in
+  <mirror>/.rive-mirror/index.json, so commands that only look can answer from disk.
+
+  fetch   [rules] --out DIR    list what is needed (or just read the saved index with
+                               --offline) and write DIR/plan.tsv, one row per file
+  classify [rules] --out DIR   apply selection, ignore words, --only and scope to plan.tsv;
+                               write todo.tsv, ref.tsv, skipped.tsv and summary.env
 """
+import argparse
+import fnmatch
 import hashlib
+import json
 import os
+import re
 import stat
+import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 
@@ -108,6 +123,397 @@ def record(stamp_path, folder):
     write_stamp(stamp_path, content_sum(files), signature(files))
 
 
+# ---- names -----------------------------------------------------------------
+
+def slug(s):
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+
+
+def clean(s):
+    return str(s).replace("\t", " ").replace("\n", " ")
+
+
+# ---- rules: selection, ignore words, --only, scope ------------------------
+
+def read_lines(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().splitlines()
+    except OSError:
+        return []
+
+
+def pattern_lines(path):
+    out = []
+    for line in read_lines(path):
+        line = line.split("#", 1)[0].strip().lower()
+        if line:
+            out.append(line)
+    return out
+
+
+class Rules:
+    """Everything that decides whether a workspace, project, folder or file is wanted."""
+
+    def __init__(self, a):
+        self.root = a.root
+        self.local = a.local
+        self.stamps = os.path.join(a.local, "stamps")
+        self.use_sel = a.use_selection
+        self.sel = []                      # (wid, lower path, "+"/"-")
+        if self.use_sel:
+            for line in read_lines(os.path.join(a.local, "selection")):
+                c = line.split("\t")
+                if len(c) >= 3 and c[0].strip():
+                    self.sel.append((c[0], c[2].lower(), "-" if len(c) > 3 and c[3] == "-" else "+"))
+        self.patterns = []                 # (pattern, where it came from)
+        if not a.no_ignore:
+            for p in pattern_lines(os.path.join(a.config, "ignore")):
+                self.patterns.append((p, "global ignore list"))
+            for p in pattern_lines(os.path.join(a.local, "ignore")):
+                self.patterns.append((p, "this mirror's ignore list"))
+            for p in (w.strip().lower() for w in a.ignore):
+                if p:
+                    self.patterns.append((p, "--ignore"))
+        self.only = [p.strip().lower() for p in a.only if p.strip()]
+        self.only_ws = set(a.workspace)
+        self.scope_abs = a.scope_abs.lower()
+        self.scope_ws = a.scope_ws
+        self.scope_proj = a.scope_proj.lower()
+
+    # -- ignore words
+    def ignored(self, name):
+        """(pattern, source) for the first word or wildcard matching this single name."""
+        s = name.lower()
+        for p, src in self.patterns:
+            if "/" in p:
+                continue
+            if any(c in p for c in "*?["):
+                if fnmatch.fnmatchcase(s, p):
+                    return p, src
+            elif p in s:
+                return p, src
+        return None
+
+    def ignored_path(self, path):
+        s = path.lower()
+        for p, src in self.patterns:
+            if "/" in p and any(fnmatch.fnmatchcase(s, g) for g in (p, p + "/*", "*/" + p, "*/" + p + "/*")):
+                return p, src
+        return None
+
+    # -- --only
+    def only_match(self, path):
+        if not self.only:
+            return True
+        s = path.lower()
+        segs = s.split("/")
+        for p in self.only:
+            if "/" in p:
+                if fnmatch.fnmatchcase(s, p) or fnmatch.fnmatchcase(s, p + "/*"):
+                    return True
+            elif any(c in p for c in "*?["):
+                if any(fnmatch.fnmatchcase(g, p) for g in segs):
+                    return True
+            elif p in s:
+                return True
+        return False
+
+    def only_possible(self, *names):
+        """Could anything below these workspace/project names still match --only?"""
+        if not self.only:
+            return True
+        for p in self.only:
+            if "/" not in p:
+                return True
+            ps = p.split("/")
+            if all(fnmatch.fnmatchcase(k.lower(), ps[i]) for i, k in enumerate(names) if i < len(ps)):
+                return True
+        return False
+
+    # -- selection: the most specific rule wins
+    def sel_match(self, wid, path):
+        """(included, winning rule path or None)."""
+        s = path.lower()
+        best, sign, rule = -1, "-", None
+        for w, p, sg in self.sel:
+            if w != str(wid):
+                continue
+            if p == "" or s == p or s.startswith(p + "/"):
+                if len(p) > best:
+                    best, sign, rule = len(p), sg, p
+        return (sign == "+" and best >= 0), rule
+
+    def sel_ws_possible(self, wid):
+        return any(w == str(wid) and sg == "+" for w, _p, sg in self.sel)
+
+    def sel_proj_possible(self, wid, pname):
+        if self.sel_match(wid, pname)[0]:
+            return True
+        s = pname.lower() + "/"
+        return any(w == str(wid) and sg == "+" and p.startswith(s) for w, p, sg in self.sel)
+
+    # -- scope
+    def in_scope(self, d):
+        if not self.scope_abs:
+            return True
+        d = d.lower()
+        return d == self.scope_abs or d.startswith(self.scope_abs + "/")
+
+    def target_dir(self, wid, wname, pname, fpath, fname, fid):
+        d = os.path.join(self.root, "%s-%s" % (slug(wname), wid), slug(pname))
+        for seg in [x for x in fpath.split("/") if x]:
+            d = os.path.join(d, slug(seg))
+        return os.path.join(d, "%s-%s" % (slug(fname), fid))
+
+
+def wanted_projects(rules, index):
+    """The projects whose files this run needs, in the order the account listed them, plus how
+    many workspaces and projects the ignore list skipped."""
+    wanted, skip_ws, skip_proj = [], 0, 0
+    for wid, wname in index.d["workspaces"]:
+        if rules.only_ws and str(wid) not in rules.only_ws:
+            continue
+        if rules.scope_ws and str(wid) != rules.scope_ws:
+            continue
+        if rules.ignored(wname):
+            skip_ws += 1
+            continue
+        if not rules.only_possible(wname):
+            continue
+        if rules.use_sel and not rules.sel_ws_possible(wid):
+            continue
+        for pid, pname in index.d["projects"].get(str(wid), {}).get("items", []):
+            if rules.scope_proj and slug(pname) != rules.scope_proj:
+                continue
+            if rules.ignored(pname):
+                skip_proj += 1
+                continue
+            if not rules.only_possible(wname, pname):
+                continue
+            if rules.use_sel and not rules.sel_proj_possible(wid, pname):
+                continue
+            wanted.append((wid, wname, pid, pname))
+    return wanted, skip_ws, skip_proj
+
+
+# ---- the index: what the account looked like the last time we asked ---------
+
+class Index:
+    def __init__(self, local):
+        self.path = os.path.join(local, "index.json")
+        self.d = {"version": 1, "fetched": 0, "workspaces": [], "projects": {}, "files": {}}
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                d = json.load(f)
+            if d.get("version") == 1:
+                self.d = d
+        except (OSError, ValueError):
+            pass
+
+    def save(self):
+        keep = {str(pid) for v in self.d["projects"].values() for pid, _n in v["items"]}
+        self.d["files"] = {k: v for k, v in self.d["files"].items() if k in keep}
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.d, f)
+        os.replace(tmp, self.path)
+
+    def oldest(self):
+        times = [v["fetched"] for v in self.d["files"].values()]
+        return min(times) if times else 0
+
+
+def rive_json(*args):
+    r = subprocess.run(["rive", *args, "--json"], capture_output=True, text=True,
+                       env=dict(os.environ, RIVE_NO_TUI="1"))
+    if r.returncode != 0:
+        lines = (r.stderr or r.stdout).strip().splitlines()
+        raise RuntimeError(lines[-1] if lines else "rive exited with %d" % r.returncode)
+    return [json.loads(l) for l in r.stdout.splitlines() if l.strip()]
+
+
+def whoami():
+    """The signed-in Rive username, or None when not signed in."""
+    try:
+        r = subprocess.run(["rive", "whoami"], capture_output=True, text=True,
+                           env=dict(os.environ, RIVE_NO_TUI="1"))
+    except OSError:
+        return None
+    if r.returncode != 0:
+        return None
+    first = (r.stdout.splitlines() or [""])[0].split()
+    return first[0] if first else ""
+
+
+def account_problem(local, me):
+    """None if the signed-in account may use this mirror, else the message to show. A mirror with
+    no account yet is bound to the signed-in one."""
+    if me is None:
+        return "not signed in: run 'rive login'"
+    path = os.path.join(local, "account")
+    want = (read_lines(path) or [""])[0]
+    if want:
+        if me and want != me:
+            return ("This mirror belongs to Rive account '%s' but you are signed in as '%s'.\n"
+                    "  Sign in as '%s' (rive logout; rive login), or run rive-mirror in the mirror for '%s'.\n"
+                    "  (To rebind this mirror to '%s', delete %s.)" % (want, me, want, me, me, path))
+    elif me:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(me + "\n")
+        print("(this mirror is now bound to Rive account '%s')" % me, file=sys.stderr)
+    return None
+
+
+def fetch(rules, index, jobs, max_age, check_local=None):
+    """Ask the account for what this run needs: workspaces, then projects, then files.
+
+    The saved index says what the last answer was, so requests that will probably still be
+    needed start right away, alongside the ones that refresh the workspace and project lists;
+    only what turns out to be new is asked for afterwards. Anything fetched less than max_age
+    seconds ago is reused (0 = always ask). Returns warnings for requests that failed."""
+    warnings = []
+    fresh = lambda ts: max_age > 0 and time.time() - ts < max_age
+    ws_ok = lambda wid: ((not rules.only_ws or str(wid) in rules.only_ws)
+                         and (not rules.scope_ws or str(wid) == rules.scope_ws))
+    projects_fresh = lambda wid: fresh(index.d["projects"].get(str(wid), {}).get("fetched", 0))
+    files_fresh = lambda pid: fresh(index.d["files"].get(str(pid), {}).get("fetched", 0))
+
+    def list_projects(wid):
+        rows = rive_json("ls", "--workspace=%s" % wid)
+        return [[r["projectId"], r["name"]] for r in rows if r.get("kind") == "project"]
+
+    def list_files(wid, pid):
+        rows = rive_json("ls", str(pid), "--all", "--workspace=%s" % wid)
+        return [[r["fileId"], r.get("path") or "", r["name"]] for r in rows if r.get("kind") == "file"]
+
+    ex = ThreadPoolExecutor(max_workers=jobs + 2)
+    try:
+        who = ex.submit(whoami) if check_local else None
+        need_ws = not (fresh(index.d["fetched"]) and index.d["workspaces"])
+        f_ws = ex.submit(rive_json, "workspace") if need_ws else None
+        f_proj, f_files = {}, {}
+        for wid, _n in index.d["workspaces"]:
+            if ws_ok(wid) and not projects_fresh(wid):
+                f_proj[wid] = ex.submit(list_projects, wid)
+        if index.d["workspaces"]:
+            for wid, _wn, pid, _pn in wanted_projects(rules, index)[0]:
+                if not files_fresh(pid):
+                    f_files[pid] = (wid, ex.submit(list_files, wid, pid))
+
+        # Who you are is checked before anything is kept.
+        if who is not None:
+            problem = account_problem(check_local, who.result())
+            if problem:
+                print(problem, file=sys.stderr)
+                raise SystemExit(3)
+        if f_ws is not None:
+            try:
+                rows = f_ws.result()
+            except (RuntimeError, OSError) as e:
+                raise SystemExit("could not list your workspaces: %s" % e)
+            index.d["workspaces"] = [[r["workspaceId"], r["name"]] for r in rows if r.get("kind") == "workspace"]
+            index.d["fetched"] = time.time()
+        for wid, _n in index.d["workspaces"]:           # workspaces we had not heard of
+            if ws_ok(wid) and wid not in f_proj and not projects_fresh(wid):
+                f_proj[wid] = ex.submit(list_projects, wid)
+        for wid, fut in f_proj.items():
+            try:
+                index.d["projects"][str(wid)] = {"fetched": time.time(), "items": fut.result()}
+            except (RuntimeError, OSError) as e:
+                warnings.append("could not list the projects of workspace %s: %s" % (wid, e))
+
+        wanted = wanted_projects(rules, index)[0]       # now that the lists are up to date
+        for wid, _wn, pid, _pn in wanted:
+            if pid not in f_files and not files_fresh(pid):
+                f_files[pid] = (wid, ex.submit(list_files, wid, pid))
+        still = {pid for _w, _wn, pid, _pn in wanted}
+        for pid, (wid, fut) in f_files.items():
+            try:
+                rows = fut.result()
+            except (RuntimeError, OSError) as e:
+                if pid in still:
+                    warnings.append("could not list project %s: %s" % (pid, e))
+                continue
+            index.d["files"][str(pid)] = {"fetched": time.time(), "rows": rows}
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    return warnings
+
+
+def plan_rows(rules, index):
+    """One row per file in the projects this run needs, from the index. Also returns how many
+    wanted projects have never been fetched, and the ignore-list skip counts."""
+    wanted, skip_ws, skip_proj = wanted_projects(rules, index)
+    rows, unfetched = [], 0
+    for wid, wname, pid, pname in wanted:
+        entry = index.d["files"].get(str(pid))
+        if entry is None:
+            unfetched += 1
+            continue
+        for fid, fpath, fname in entry["rows"]:
+            rows.append((wid, wname, pname, fid, fpath, fname))
+    return rows, unfetched, skip_ws, skip_proj
+
+
+def folders_on_disk(root):
+    """{fileId: folder} for every mirrored project folder (anything with a rive.yaml that has a
+    push: fileId). Doesn't look inside a project folder."""
+    have = {}
+    for base, dirs, names in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in (".rive-mirror", ".libraries")]
+        if "rive.yaml" in names:
+            dirs[:] = []
+            in_push = False
+            try:
+                with open(os.path.join(base, "rive.yaml"), encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if line.startswith("push:"):
+                            in_push = True
+                        elif line.strip() and line[0] not in " \t":
+                            in_push = False
+                        elif in_push:
+                            m = re.match(r"\s*fileId:\s*(\S+)", line)
+                            if m:
+                                have.setdefault(m.group(1), base)
+                                break
+            except OSError:
+                pass
+    return have
+
+
+def classify(rules, rows, want_refresh):
+    have = folders_on_disk(rules.root)
+    todo, ref, skipped = [], [], []
+    count = dict(total=0, have=0, nign=0, nonly=0)
+    for wid, wname, pname, fid, fpath, fname in rows:
+        fpath = "" if fpath in (".", None) else fpath
+        fid = str(fid)
+        if rules.scope_abs:
+            where = have.get(fid) or rules.target_dir(wid, wname, pname, fpath, fname, fid)
+            if not rules.in_scope(where):
+                continue
+        count["total"] += 1
+        inner = (fpath + "/" if fpath else "") + fname
+        if not rules.only_match("%s/%s/%s" % (wname, pname, inner)):
+            count["nonly"] += 1
+            continue
+        if rules.use_sel and not rules.sel_match(wid, "%s/%s" % (pname, inner))[0]:
+            continue
+        if (rules.ignored(fname) or rules.ignored_path("%s/%s/%s" % (wname, pname, inner))
+                or any(rules.ignored(seg) for seg in fpath.split("/") if seg)):
+            count["nign"] += 1
+            skipped.append(("file", inner))
+            continue
+        if fid in have:
+            count["have"] += 1
+            if want_refresh:
+                ref.append((fid, have[fid], wid))
+            continue
+        todo.append((fid, rules.target_dir(wid, wname, pname, fpath, fname, fid), wid))
+    return todo, ref, skipped, count
+
+
 # ---- command line ---------------------------------------------------------
 
 def cmd_state(stamps):
@@ -119,7 +525,78 @@ def cmd_state(stamps):
         print("%s\t%s\t%s\t%s" % (st, r[0], r[1], r[2]))
 
 
+def add_rule_args(p):
+    p.add_argument("--root", required=True)
+    p.add_argument("--local", required=True)
+    p.add_argument("--config", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--use-selection", action="store_true")
+    p.add_argument("--no-ignore", action="store_true")
+    p.add_argument("--ignore", action="append", default=[])
+    p.add_argument("--only", action="append", default=[])
+    p.add_argument("--workspace", action="append", default=[])
+    p.add_argument("--scope-abs", default="")
+    p.add_argument("--scope-ws", default="")
+    p.add_argument("--scope-proj", default="")
+    p.add_argument("--refresh", action="store_true")
+    p.add_argument("--check-account", action="store_true", help="refuse unless the signed-in account owns this mirror")
+    p.add_argument("--offline", action="store_true", help="never ask the account; use the saved index")
+    p.add_argument("--max-age", type=int, default=0, help="reuse listings newer than this many seconds")
+    p.add_argument("--jobs", type=int, default=int(os.environ.get("RIVE_MIRROR_JOBS") or 4))
+
+
+def write_rows(path, rows):
+    with open(path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write("\t".join(clean(x) for x in r) + "\n")
+
+
+def cmd_fetch(a):
+    rules, index = Rules(a), Index(a.local)
+    os.makedirs(a.out, exist_ok=True)
+    if not a.offline:
+        for w in fetch(rules, index, max(1, min(a.jobs, 8)), a.max_age, a.local if a.check_account else None):
+            print("warning: " + w, file=sys.stderr)
+        index.save()
+    rows, unfetched, skip_ws, skip_proj = plan_rows(rules, index)
+    write_rows(os.path.join(a.out, "plan.tsv"),
+               [(w, wn, pn, fid, fp or ".", fn) for w, wn, pn, fid, fp, fn in rows])
+    with open(os.path.join(a.out, "fetch.env"), "w") as f:
+        f.write("UNFETCHED=%d\nSKIP_WS=%d\nSKIP_PROJ=%d\nINDEX_AGE=%d\n" % (
+            unfetched, skip_ws, skip_proj, int(time.time() - index.oldest()) if index.d["files"] else -1))
+
+
+def cmd_classify(a):
+    rules = Rules(a)
+    rows = []
+    for line in read_lines(os.path.join(a.out, "plan.tsv")):
+        c = line.split("\t")
+        if len(c) >= 6:
+            rows.append((c[0], c[1], c[2], c[3], c[4], c[5]))
+    todo, ref, skipped, count = classify(rules, rows, a.refresh)
+    write_rows(os.path.join(a.out, "todo.tsv"), todo)
+    write_rows(os.path.join(a.out, "ref.tsv"), ref)
+    write_rows(os.path.join(a.out, "skipped.tsv"), skipped)
+    with open(os.path.join(a.out, "summary.env"), "w") as f:
+        f.write("TOTAL=%d\nHAVE=%d\nNIGN=%d\nNONLY=%d\nNTODO=%d\n" % (
+            count["total"], count["have"], count["nign"], count["nonly"], len(todo)))
+
+
 def cli(argv):
+    if argv and argv[0] in ("fetch", "classify"):
+        p = argparse.ArgumentParser(prog="rive-mirror-engine " + argv[0])
+        add_rule_args(p)
+        a = p.parse_args(argv[1:])
+        (cmd_fetch if argv[0] == "fetch" else cmd_classify)(a)
+        return 0
+    if argv and argv[0] == "account":
+        p = argparse.ArgumentParser(prog="rive-mirror-engine account")
+        p.add_argument("--local", required=True)
+        problem = account_problem(p.parse_args(argv[1:]).local, whoami())
+        if problem:
+            print(problem, file=sys.stderr)
+            return 3
+        return 0
     if len(argv) >= 2 and argv[0] == "sum":
         print(content_sum(scan(argv[1])))
     elif len(argv) >= 4 and argv[0] == "stamp":

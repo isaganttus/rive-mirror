@@ -4,7 +4,10 @@
 #   workspaces.jsonl, projects_<workspaceId>.jsonl, files_<projectId>.jsonl  what `ls` returns
 #   remote_<fileId>      the file's content in the "Editor"
 #   pullfail_<fileId>    if present, `rive pull` fails for that file
+#   lsfail_<projectId>   if present, listing that project's files fails
+#   calls.log            every call, one per line
 D="$FAKE_DATA"
+echo "$*" >> "$D/calls.log" 2>/dev/null   # tests look at what was asked
 case "$1" in
   whoami) echo "${FAKE_USER:-alice} alice@example.com"; echo "workspace: Studio (5)"; exit 0 ;;
   workspace) [ "${2:-}" = --json ] && cat "$D/workspaces.jsonl"; exit 0 ;;
@@ -17,6 +20,7 @@ case "$1" in
         cat "$D/remote_$fid" > "$dir/scene.rml"; exit 0 ;;
   ls) shift; pid=""; ws=""
       for a in "$@"; do case "$a" in --workspace=*) ws=${a#*=} ;; --json|--all) ;; *) pid=$a ;; esac; done
+      [ -n "$pid" ] && [ -f "$D/lsfail_$pid" ] && { echo "listing failed" >&2; exit 1; }
       if [ -z "$pid" ]; then cat "$D/projects_$ws.jsonl" 2>/dev/null; else cat "$D/files_$pid.jsonl" 2>/dev/null; fi
       exit 0 ;;
 esac

@@ -72,13 +72,39 @@ has "only the ticked project is listed" "4 files visible" "$out"
 rm .rive-mirror/selection
 
 # --- account guard and lock ---
+cp .rive-mirror/index.json "$T/index.before"
 out=$(FAKE_USER=bob run --dry-run); rc=$?
 has "wrong account is refused" "belongs to Rive account 'alice'" "$out"; eq "wrong account: exit 3" 3 "$rc"
+cmp -s .rive-mirror/index.json "$T/index.before" && has "a refused run leaves the index alone" ok ok || has "a refused run leaves the index alone" ok changed
 mkdir .rive-mirror/lock; sleep 30 & held=$!; echo "$held" > .rive-mirror/lock/pid
 out=$(run --yes); rc=$?; has "a running copy blocks a second" "is running in this mirror" "$out"; eq "lock: exit 4" 4 "$rc"
 kill "$held" 2>/dev/null; wait "$held" 2>/dev/null; echo 999999 > .rive-mirror/lock/pid
 out=$(run --yes); rc=$?; eq "a stale lock is taken over" 0 "$rc"
 [ ! -d .rive-mirror/lock ] && has "the lock is released afterwards" ok ok || has "the lock is released afterwards" ok left-behind
+
+# --- --only, --workspace, --ignore for one run ---
+out=$(run --dry-run --only=heart); has "--only with a word" "1 match" "$out"
+out=$(run --dry-run --only='studio/icon pack'); has "--only with a path" "2 match" "$out"
+out=$(run --dry-run --workspace=99); has "--workspace picks a workspace" "0 files visible" "$out"
+out=$(run --dry-run --ignore=heart); has "--ignore for one run" "0 workspaces, 0 projects, 1 files" "$out"
+
+# --- the saved index: the account is listed once, then it can be read from disk ---
+[ -f .rive-mirror/index.json ] && has "a sync saves the index" ok ok || has "a sync saves the index" ok missing
+has "workspaces are never switched" "0" "$(grep -c '^workspace [0-9]' "$D/calls.log")"
+mkdir "$T/empty"
+out=$(FAKE_DATA="$T/empty" run --offline --dry-run); has "offline answers from the index" "6 files visible, 6 already mirrored" "$out"
+out=$(run --offline); has "offline refuses to download" "--offline only works with --dry-run" "$out"
+: > "$D/calls.log"; out=$(run fetch); has "fetch lists the account" "listed 6 files" "$out"
+has "fetch asks for workspaces, projects and files" "5" "$(wc -l < "$D/calls.log" | tr -d ' ')"
+
+# a project that appears after the last listing is picked up; a failed listing falls back to the saved one
+printf '%s\n' '{"kind":"project","projectId":52,"name":"Extra"}' >> "$D/projects_5.jsonl"
+echo '{"kind":"file","fileId":7,"path":"","name":"Fresh"}' > "$D/files_52.jsonl"; echo "v1-7" > "$D/remote_7"
+out=$(run --dry-run --no-check); has "a new project is found" "7 files visible, 6 already mirrored, 1 to download" "$out"
+touch "$D/lsfail_51"; out=$(run --dry-run --no-check)
+has "a failed listing warns" "warning: could not list project 51" "$out"
+has "and falls back to the saved listing" "7 files visible" "$out"
+rm "$D/lsfail_51" "$D/files_52.jsonl"; sed -i.bak '/"Extra"/d' "$D/projects_5.jsonl"; run --dry-run --no-check >/dev/null
 
 # --- change detection (the engine) ---
 E="$HERE/../rive-mirror-engine.py"
