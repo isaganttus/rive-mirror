@@ -45,6 +45,7 @@ export RIVE_NO_TUI=1
 GLOBAL="${XDG_CONFIG_HOME:-$HOME/.config}/rive-mirror"
 GIGN="$GLOBAL/ignore"
 SELF_DIR=$(python3 -I -c 'import os,sys;print(os.path.dirname(os.path.realpath(sys.argv[1])))' "$0")
+ENGINE="$SELF_DIR/rive-mirror-engine.py"
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 norm() { local p="${1/#\~/$HOME}"; case "$p" in /*) ;; *) p="$PWD/$p" ;; esac; printf '%s' "${p%/}"; }
 
@@ -281,14 +282,11 @@ if [ "$ONLY" = " " ] && [ -z "$ONLY_RAW" ] && [ "$EVERYTHING" = 0 ]; then
 fi
 
 # ---- change tracking for --refresh ----
-# After a download or refresh, a checksum of the folder's files is saved under the config dir
-# (stamps/<fileId>). A folder is "unchanged" while its checksum still matches the saved one.
-# Stamps live in the mirror's .rive-mirror folder, not in the projects, so nothing extra gets pushed.
-folder_sum() {
-  ( cd "$1" && LC_ALL=C find . -type f -not -path './.git/*' -not -name .DS_Store -print0 | LC_ALL=C sort -z |
-    xargs -0 shasum -a 256 2>/dev/null | shasum -a 256 | cut -d' ' -f1 )
-}
-stamp_set() { mkdir -p "$STAMPS"; folder_sum "$2" > "$STAMPS/$1"; }
+# After a download or refresh, the folder's state is saved in the mirror's .rive-mirror/stamps/<fileId>
+# (see rive-mirror-engine.py). A folder is "unchanged" while its files still match. Stamps live
+# outside the projects, so nothing extra gets pushed.
+stamp_set() { python3 -I "$ENGINE" stamp "$STAMPS" "$1" "$2"; }
+stamp_sum() { head -n 1 "$STAMPS/$1" 2>/dev/null || true; }
 
 # ---- ignore patterns (case-insensitive): global list + this mirror's list + --ignore ----
 PATTERNS=()
@@ -509,12 +507,10 @@ done < "$PLAN"
 # ---- --refresh: pull the Editor version into folders that have no local changes ----
 if [ "$REFRESH" = 1 ]; then
   CLEAN="$TMP/clean.tsv"; NOBASE="$TMP/nobase.tsv"; CHANGED="$TMP/changed.txt"; : > "$CLEAN"; : > "$NOBASE"; : > "$CHANGED"
-  while IFS=$'\t' read -r fid dir wid; do
-    [ -d "$dir" ] || continue
-    if [ ! -f "$STAMPS/$fid" ]; then printf '%s\t%s\t%s\n' "$fid" "$dir" "$wid" >> "$NOBASE"
-    elif [ "$(folder_sum "$dir")" = "$(cat "$STAMPS/$fid")" ]; then printf '%s\t%s\t%s\n' "$fid" "$dir" "$wid" >> "$CLEAN"
-    else printf '%s\t%s\t%s\n' "$fid" "$dir" "$wid" >> "$CHANGED"; fi
-  done < "$REF"
+  python3 -I "$ENGINE" state "$STAMPS" < "$REF" > "$TMP/states.tsv"
+  awk -F'\t' -v OFS='\t' -v c="$CLEAN" -v n="$NOBASE" -v h="$CHANGED" \
+    '$1=="clean"{print $2,$3,$4 > c} $1=="nobase"{print $2,$3,$4 > n} $1=="changed"{print $2,$3,$4 > h}' "$TMP/states.tsv"
+  touch "$CLEAN" "$NOBASE" "$CHANGED"
   nclean=$(wc -l < "$CLEAN" | tr -d ' '); nbase=$(wc -l < "$NOBASE" | tr -d ' '); nchg=$(wc -l < "$CHANGED" | tr -d ' ')
   echo "$((nclean+nbase+nchg)) mirrored folders in scope: $nclean unchanged, $nchg with local changes, $nbase with no baseline yet"
 
@@ -556,10 +552,10 @@ if [ "$REFRESH" = 1 ]; then
   while IFS=$'\t' read -r fid dir wid; do
     i=$((i+1)); printf '[%s/%s] %s ' "$i" "$nclean" "${dir#$ROOT/}"
     if [ "$CUR_WS" != "$wid" ]; then rive workspace "$wid" >/dev/null; CUR_WS="$wid"; fi
-    before=$(folder_sum "$dir")
+    before=$(stamp_sum "$fid")
     if rive pull "$dir" --yes --quiet >"$TMP/out.log" 2>&1; then
       stamp_set "$fid" "$dir"
-      if [ "$(cat "$STAMPS/$fid")" = "$before" ]; then same=$((same+1)); echo "(same)"; else upd=$((upd+1)); echo "(updated)"; fi
+      if [ "$(stamp_sum "$fid")" = "$before" ]; then same=$((same+1)); echo "(same)"; else upd=$((upd+1)); echo "(updated)"; fi
     else
       failed=$((failed+1)); echo "FAILED: $(tail -1 "$TMP/out.log")"
     fi

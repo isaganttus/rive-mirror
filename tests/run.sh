@@ -80,4 +80,22 @@ kill "$held" 2>/dev/null; wait "$held" 2>/dev/null; echo 999999 > .rive-mirror/l
 out=$(run --yes); rc=$?; eq "a stale lock is taken over" 0 "$rc"
 [ ! -d .rive-mirror/lock ] && has "the lock is released afterwards" ok ok || has "the lock is released afterwards" ok left-behind
 
+# --- change detection (the engine) ---
+E="$HERE/../rive-mirror-engine.py"
+mkdir -p "$T/sum/sub dir" "$T/sum/.git"; echo a > "$T/sum/one.txt"; echo b > "$T/sum/sub dir/two txt"
+echo junk > "$T/sum/.DS_Store"; echo x > "$T/sum/.git/config"
+ref=$(cd "$T/sum" && LC_ALL=C find . -type f -not -path './.git/*' -not -name .DS_Store -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -d' ' -f1)
+eq "checksum matches the original shell algorithm" "$ref" "$(python3 -I "$E" sum "$T/sum")"
+python3 -I "$E" stamp "$T/st" 9 "$T/sum"
+state() { printf '%s\t%s\t5\n' "$1" "$2" | python3 -I "$E" state "$T/st" | cut -f1; }
+eq "an untouched folder is clean" clean "$(state 9 "$T/sum")"
+touch "$T/sum/one.txt"; eq "new timestamp, same contents: still clean" clean "$(state 9 "$T/sum")"
+echo changed > "$T/sum/one.txt"; eq "an edited file makes the folder changed" changed "$(state 9 "$T/sum")"
+echo new > "$T/sum/extra.txt"; python3 -I "$E" stamp "$T/st" 9 "$T/sum"; rm "$T/sum/extra.txt"
+eq "a removed file makes it changed" changed "$(state 9 "$T/sum")"
+eq "no stamp yet" nobase "$(state 10 "$T/sum")"
+eq "folder is gone" missing "$(state 9 "$T/nowhere")"
+python3 -I "$E" stamp "$T/st" 9 "$T/sum"; touch -r "$T/sum/one.txt" "$T/ref.time"; printf 'zzzzzzz\n' > "$T/sum/one.txt"; touch -r "$T/ref.time" "$T/sum/one.txt"
+eq "same size and time is trusted, like git's index" clean "$(state 9 "$T/sum")"
+
 echo; echo "$pass passed, $fail failed"; [ "$fail" = 0 ]
