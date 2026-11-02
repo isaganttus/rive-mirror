@@ -329,7 +329,7 @@ if [ "$USE_SEL" = 1 ] && [ "$NOCHECK" = 0 ] && [ "$REFRESH" = 0 ] && [ -z "$SCOP
     printf '%s' "$CLI_PATTERNS"; } | tr '[:upper:]' '[:lower:]' | grep . > "$TMP/patterns.txt" || true
   [ "$NOIGN" = 0 ] || : > "$TMP/patterns.txt"
   rc=0
-  python3 -I "$SELF_DIR/rive-mirror-select.py" --check "$PLAN" --patterns "$TMP/patterns.txt" \
+  python3 -I "$SELF_DIR/rive-mirror-select.py" --check "$PLAN" --patterns "$TMP/patterns.txt" --index "$LOCAL/index.json" \
     $([ "$DRY" = 1 ] && echo --report-only) || rc=$?
   if [ "$rc" = 10 ]; then
     unlock; rm -rf "$TMP"

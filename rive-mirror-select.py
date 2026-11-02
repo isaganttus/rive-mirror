@@ -351,17 +351,34 @@ def ignored(pats, segs):
     return False
 
 
-def check_new(plan_file, patterns_file, report_only):
+def indexed_account(index_path):
+    """Workspaces and projects from the saved listing (written by the engine), shaped like the
+    answers from `rive`, so the check doesn't ask the account again."""
+    with open(index_path, encoding="utf-8") as f:
+        d = json.load(f)
+    workspaces = [{"kind": "workspace", "workspaceId": int(w), "name": n} for w, n in d["workspaces"]]
+    current = set()
+    for w in workspaces:
+        current.add(("w", w["workspaceId"], ""))
+        for _pid, pname in d["projects"].get(str(w["workspaceId"]), {}).get("items", []):
+            current.add(("p", w["workspaceId"], pname))
+    return workspaces, current
+
+
+def check_new(plan_file, patterns_file, report_only, index_path=None):
     """Compare the world now with `known`. Returns 10 if the selection was changed."""
     sel, names = read_selection()
     rules = {(w, tuple(s.casefold() for s in p)): v for (w, p), v in sel.items()}
     pats = load_patterns(patterns_file)
-    workspaces = [r for r in rive_json("workspace") if r.get("kind") == "workspace"]
+    try:
+        workspaces, current = indexed_account(index_path)
+    except (OSError, ValueError, KeyError, TypeError):
+        workspaces = [r for r in rive_json("workspace") if r.get("kind") == "workspace"]
+        current = snapshot_projects(workspaces)
     for w in workspaces:
         names[w["workspaceId"]] = w["name"]
 
     # current layout: workspaces + projects from the account, folders from the sync's plan
-    current = snapshot_projects(workspaces)
     folders_by_proj = {}
     with open(plan_file, encoding="utf-8") as f:
         for line in f:
@@ -468,8 +485,9 @@ def cli():
         args = sys.argv[2:]
         plan = args[0]
         pats = args[args.index("--patterns") + 1] if "--patterns" in args else None
+        index = args[args.index("--index") + 1] if "--index" in args else None
         try:
-            return check_new(plan, pats, "--report-only" in args)
+            return check_new(plan, pats, "--report-only" in args, index)
         except (RuntimeError, OSError) as e:
             print("could not check for new items: %s" % e, file=sys.stderr)
             return 0

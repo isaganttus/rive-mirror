@@ -71,6 +71,16 @@ has "the selection applies inside a subfolder" "Using your saved selection (1 ru
 has "only the ticked project is listed" "4 files visible" "$out"
 rm .rive-mirror/selection
 
+# --- new things the rules don't cover are flagged, from the saved listing ---
+printf '5\tStudio\tBrand\t+\n' > .rive-mirror/selection
+out=$(run --yes); has "first run records a starting point" "Recorded what exists now" "$out"
+printf '%s\n' '{"kind":"project","projectId":54,"name":"Newcomer"}' >> "$D/projects_5.jsonl"
+echo '{"kind":"file","fileId":10,"path":"","name":"N"}' > "$D/files_54.jsonl"
+: > "$D/calls.log"; out=$(run --dry-run)
+has "a new project outside the rules is flagged" "project   Studio / Newcomer" "$out"
+eq "the check does not list the account again" 1 "$(grep -c '^ls --workspace=5' "$D/calls.log")"
+rm .rive-mirror/selection .rive-mirror/known "$D/files_54.jsonl"; sed -i.bak '/"Newcomer"/d' "$D/projects_5.jsonl"; run --dry-run --no-check >/dev/null
+
 # --- account guard and lock ---
 cp .rive-mirror/index.json "$T/index.before"
 out=$(FAKE_USER=bob run --dry-run); rc=$?
