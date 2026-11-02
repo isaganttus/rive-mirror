@@ -9,13 +9,17 @@
 #                                  checksums from ~/.config/rive-mirror) into this mirror
 #   rive-mirror select             tick workspaces/projects/folders to keep mirrored (this mirror's rules)
 #   rive-mirror select --list      show the rules  (--clear forgets them)
-#   rive-mirror                    download what's missing, for the rules, inside the current folder
+#   rive-mirror [sync]             download what's missing, for the rules, inside the current folder
 #                                  (flags new workspaces/projects/folders the rules don't cover;
 #                                   --no-check skips that, and it only runs from the mirror's top)
+#   rive-mirror status             where things stand: what is mirrored, changed, missing, ignored
+#   rive-mirror why NAME           why a workspace, project or file matching NAME is (or isn't) mirrored,
+#                                  and which selection rule or ignore word decides
+#                                  (status and why read the saved listing; they never ask Rive)
 #   rive-mirror fetch              list your account and save the answer (.rive-mirror/index.json);
 #                                  downloads nothing
 #   rive-mirror --dry-run --offline   report from that saved listing without asking Rive at all
-#   rive-mirror --refresh          update already-mirrored folders from the Editor, but ONLY the
+#   rive-mirror refresh            same as --refresh:  update already-mirrored folders from the Editor, but ONLY the
 #                                  ones with no local changes; the rest are listed and left alone
 #   rive-mirror --refresh --baseline   one-off for folders mirrored before --refresh existed:
 #                                  record them as "unchanged as of now" (pulls nothing)
@@ -211,8 +215,15 @@ if [ "${1:-}" = ignore ]; then
 fi
 
 ORIG_ARGS=("$@")
-REFRESH=0; BASELINE=0; OFFLINE=0; FETCH_ONLY=0
-[ "${1:-}" != fetch ] || { FETCH_ONLY=1; shift; }
+REFRESH=0; BASELINE=0; OFFLINE=0; FETCH_ONLY=0; STATUS=0; WHY=""
+case "${1:-}" in
+  fetch)   FETCH_ONLY=1; shift ;;
+  status)  STATUS=1; OFFLINE=1; shift ;;
+  why)     [ -n "${2:-}" ] || { echo "usage: rive-mirror why NAME" >&2; exit 2; }
+           WHY="$2"; OFFLINE=1; shift 2 ;;
+  refresh) REFRESH=1; shift ;;
+  sync)    shift ;;
+esac
 DRY=0; YES=0; ALL=0; EVERYTHING=0; NOCHECK=0; LIMIT=0; ONLY=" "; NOIGN=0; CLI_PATTERNS=""; ONLY_RAW=""
 
 while [ $# -gt 0 ]; do
@@ -237,6 +248,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+[ "$STATUS" = 0 ] && [ -z "$WHY" ] || DRY=1
 [ "$BASELINE" = 0 ] || [ "$REFRESH" = 1 ] || { echo "--baseline goes with --refresh" >&2; exit 2; }
 [ "$OFFLINE" = 0 ] || [ "$DRY" = 1 ] || { echo "--offline only works with --dry-run (nothing can be downloaded without asking Rive)" >&2; exit 2; }
 
@@ -267,7 +279,7 @@ command -v jq   >/dev/null || { echo "jq not found (brew install jq)" >&2; exit 
 # Saved selection (from `rive-mirror select`) is used unless this run says otherwise.
 USE_SEL=0
 if [ "$ONLY" = " " ] && [ -z "$ONLY_RAW" ] && [ "$EVERYTHING" = 0 ]; then
-  if [ ! -s "$SEL_FILE" ] && [ -t 0 ] && [ -t 1 ]; then
+  if [ ! -s "$SEL_FILE" ] && [ -t 0 ] && [ -t 1 ] && [ "$OFFLINE" = 0 ]; then
     echo "No selection saved yet; opening the selector."
     python3 -I "$SELF_DIR/rive-mirror-select.py" || exit 0
   fi
@@ -297,7 +309,7 @@ if [ "$DRY" = 0 ]; then
 fi
 
 # ---- the rules (selection, ignore words, --only, scope) are applied by the engine ----
-if [ "$USE_SEL" = 1 ]; then
+if [ "$USE_SEL" = 1 ] && [ "$STATUS" = 0 ] && [ -z "$WHY" ]; then
   echo "Using your saved selection ($(grep -c . "$SEL_FILE" || true) rules). Change: rive-mirror select   Everything: --all"
 fi
 ENG=(--root "$ROOT" --local "$LOCAL" --config "$GLOBAL" --out "$TMP")
@@ -307,7 +319,10 @@ while IFS= read -r l; do [ -z "$l" ] || ENG+=(--ignore "$l"); done <<< "$CLI_PAT
 while IFS= read -r l; do [ -z "$l" ] || ENG+=(--only "$l"); done <<< "$ONLY_RAW"
 for w in $ONLY; do ENG+=(--workspace "$w"); done
 [ -z "$SCOPE_ABS" ] || ENG+=(--scope-abs "$SCOPE_ABS" --scope-ws "$SCOPE_WS" --scope-proj "$SCOPE_PROJ")
-[ "$REFRESH" = 0 ] || ENG+=(--refresh)
+[ "$REFRESH" = 0 ] && [ "$STATUS" = 0 ] || ENG+=(--refresh)
+
+# why NAME: explain from the saved listing; nothing else to do
+if [ -n "$WHY" ]; then python3 -I "$ENGINE" why "${ENG[@]}" --name "$WHY"; exit $?; fi
 
 # 1. List the account (several requests at a time) into the saved index, and write plan.tsv:
 #    one row per file in the projects this run needs.
@@ -322,12 +337,17 @@ if [ "$OFFLINE" = 1 ] && [ "$UNFETCHED" -gt 0 ]; then
   echo "note: $UNFETCHED projects have never been listed; run 'rive-mirror fetch' to include them" >&2
 fi
 
-# 1b. Anything new since you made the selection? Flags what the rules don't cover and lets
-#     you add it. If the selection changes, start over (reusing the listing just made).
-if [ "$USE_SEL" = 1 ] && [ "$NOCHECK" = 0 ] && [ "$REFRESH" = 0 ] && [ -z "$SCOPE_ABS" ] && [ "$OFFLINE" = 0 ]; then
+# The ignore words in effect, for the new-item check.
+write_patterns() {
   { for l in "$GLOBAL/ignore" "$LIGN"; do [ ! -f "$l" ] || sed -E 's/#.*//; s/^[[:space:]]+|[[:space:]]+$//g' "$l"; done
     printf '%s' "$CLI_PATTERNS"; } | tr '[:upper:]' '[:lower:]' | grep . > "$TMP/patterns.txt" || true
   [ "$NOIGN" = 0 ] || : > "$TMP/patterns.txt"
+}
+
+# 1b. Anything new since you made the selection? Flags what the rules don't cover and lets
+#     you add it. If the selection changes, start over (reusing the listing just made).
+if [ "$USE_SEL" = 1 ] && [ "$NOCHECK" = 0 ] && [ "$REFRESH" = 0 ] && [ -z "$SCOPE_ABS" ] && [ "$OFFLINE" = 0 ]; then
+  write_patterns
   rc=0
   python3 -I "$SELF_DIR/rive-mirror-select.py" --check "$PLAN" --patterns "$TMP/patterns.txt" --index "$LOCAL/index.json" \
     $([ "$DRY" = 1 ] && echo --report-only) || rc=$?
@@ -342,6 +362,51 @@ python3 -I "$ENGINE" classify "${ENG[@]}" || exit $?
 . "$TMP/summary.env"
 total=$TOTAL; have=$HAVE; nign=$NIGN; nonly=$NONLY
 TODO="$TMP/todo.tsv"; REF="$TMP/ref.tsv"
+
+# ---- status: an overview from the saved listing and the disk; nothing is asked of Rive ----
+if [ "$STATUS" = 1 ]; then
+  age_text() {
+    if [ "$1" -lt 0 ]; then echo "never (run: rive-mirror fetch)"
+    elif [ "$1" -lt 90 ]; then echo "$1 seconds ago"
+    elif [ "$1" -lt 5400 ]; then echo "$(($1 / 60)) minutes ago"
+    elif [ "$1" -lt 172800 ]; then echo "$(($1 / 3600)) hours ago"
+    else echo "$(($1 / 86400)) days ago"; fi
+  }
+  words() { local n; n=$(grep -vcE '^[[:space:]]*(#|$)' "$1" 2>/dev/null || true); echo "${n:-0}"; }
+  python3 -I "$ENGINE" state "$STAMPS" < "$REF" > "$TMP/states.tsv"
+  count_state() { awk -F'\t' -v s="$1" '$1==s' "$TMP/states.tsv" | wc -l | tr -d ' '; }
+  nclean=$(count_state clean); nchg=$(count_state changed); nbase=$(count_state nobase)
+  echo "Mirror:   $ROOT   (Rive account: $(head -n 1 "$LOCAL/account" 2>/dev/null || echo "not set yet"))"
+  [ -z "$SCOPE_NOTE" ] || echo "Here:     $SCOPE_NOTE"
+  echo "Listing:  saved $(age_text "$INDEX_AGE")"
+  if [ "$USE_SEL" = 1 ]; then rules_text="selection of $(grep -c . "$SEL_FILE") rules"; else rules_text="no selection (everything)"; fi
+  echo "Rules:    $rules_text; ignore words: $(words "$GIGN") global, $(words "$LIGN") for this mirror"
+  echo
+  echo "$total files in scope"
+  echo "  $have mirrored: $nclean unchanged, $nchg with local changes, $nbase with no checksum yet"
+  echo "  $NTODO not downloaded yet"
+  [ "$nign" = 0 ]    || echo "  $nign ignored by your ignore list"
+  [ "$NSEL" = 0 ]    || echo "  $NSEL not covered by your selection"
+  [ "$nonly" = 0 ]   || echo "  $nonly left out by --only"
+  [ "$OUTSIDE" -le 0 ] || echo "  $OUTSIDE folders on disk are outside these rules (nothing touches them)"
+  [ "$UNFETCHED" = 0 ] || echo "  $UNFETCHED projects have never been listed: run 'rive-mirror fetch'"
+  if [ "$USE_SEL" = 1 ] && [ -z "$SCOPE_ABS" ] && [ -s "$PLAN" ]; then
+    write_patterns
+    newout=$(python3 -I "$SELF_DIR/rive-mirror-select.py" --check "$PLAN" --patterns "$TMP/patterns.txt" \
+      --index "$LOCAL/index.json" --report-only 2>/dev/null || true)
+    case "$newout" in *"New since"*) echo; printf '%s\n' "$newout" | grep -v '^(Run rive-mirror' ;; esac
+  fi
+  if [ "$nchg" -gt 0 ]; then
+    echo; echo "Local changes in:"; awk -F'\t' '$1=="changed"{print $3}' "$TMP/states.tsv" | head -n 5 | sed "s|^$ROOT/|  |"
+    [ "$nchg" -le 5 ] || echo "  ...and $((nchg - 5)) more"
+  fi
+  echo
+  next=""
+  [ "$NTODO" = 0 ] || next="rive-mirror (download $NTODO)"
+  [ "$nclean" = 0 ] || next="${next:+$next, }rive-mirror refresh (update $nclean unchanged)"
+  echo "Next:     ${next:-nothing to do}"
+  exit 0
+fi
 
 # ---- --refresh: pull the Editor version into folders that have no local changes ----
 if [ "$REFRESH" = 1 ]; then

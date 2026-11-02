@@ -127,6 +127,25 @@ has "and counted, while the others finish" "done: 1 downloaded, 1 failed" "$out"
 [ -f studio-5/odd/fine-9/rive.yaml ] && has "the next file still downloads" ok ok || has "the next file still downloads" ok missing
 rm "$D/createfail_8" "$D/files_53.jsonl"; sed -i.bak '/"Odd"/d' "$D/projects_5.jsonl"; rm -rf studio-5/odd; run --dry-run --no-check >/dev/null
 
+# --- status and why: answered from disk, without asking Rive ---
+: > "$D/calls.log"; out=$(run status)
+has "status names the mirror and account" "(Rive account: alice)" "$out"
+has "status counts what is mirrored" "6 mirrored:" "$out"
+has "status says what to do next" "Next:" "$out"
+eq "status asks Rive nothing" 0 "$(wc -l < "$D/calls.log" | tr -d ' ')"
+out=$(cd studio-5/brand && run status); has "status follows the folder you are in" "Here:     studio-5/brand" "$out"
+run ignore add heart >/dev/null
+out=$(run why heart); has "why: names the ignore word and where it came from" "matches ignore word 'heart' (this mirror's ignore list)" "$out"
+run ignore rm heart >/dev/null
+printf '5\tStudio\tBrand\t+\n5\tStudio\tBrand/Menu\t-\n' > .rive-mirror/selection
+out=$(run why star); has "why: a project outside the selection" "no selection rule includes anything in this project" "$out"
+out=$(run why logo); has "why: a file inside it" "covered by selection rule '+ Studio / Brand'" "$out"
+out=$(run why menu); has "why: a file the selection excludes" "selection rule '- Studio / Brand/Menu' excludes it" "$out"
+out=$(run why nosuchthing); has "why: nothing matches" "nothing in the saved listing matches" "$out"
+rm .rive-mirror/selection
+out=$(run refresh --dry-run); has "refresh works as a command" "mirrored folders in scope" "$out"
+out=$(run sync --dry-run --no-check); has "sync works as a command" "files visible" "$out"
+
 # --- change detection (the engine) ---
 E="$HERE/../rive-mirror-engine.py"
 mkdir -p "$T/sum/sub dir" "$T/sum/.git"; echo a > "$T/sum/one.txt"; echo b > "$T/sum/sub dir/two txt"

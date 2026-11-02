@@ -24,6 +24,9 @@ Listing your account
                                run `rive create` / `rive pull` for each "fid TAB dir TAB wid"
                                row, several at a time, saving each folder's state afterwards
 
+  why [rules] --name TEXT      explain, from the saved listing, whether workspaces, projects
+                               and files matching TEXT are mirrored, and which rule decides
+
   fetch   [rules] --out DIR    list what is needed (or just read the saved index with
                                --offline) and write DIR/plan.tsv, one row per file
   classify [rules] --out DIR   apply selection, ignore words, --only and scope to plan.tsv;
@@ -166,11 +169,14 @@ class Rules:
         self.stamps = os.path.join(a.local, "stamps")
         self.use_sel = a.use_selection
         self.sel = []                      # (wid, lower path, "+"/"-")
+        self.sel_label = {}                # (wid, lower path) -> "+ Workspace / path", for explanations
         if self.use_sel:
             for line in read_lines(os.path.join(a.local, "selection")):
                 c = line.split("\t")
                 if len(c) >= 3 and c[0].strip():
-                    self.sel.append((c[0], c[2].lower(), "-" if len(c) > 3 and c[3] == "-" else "+"))
+                    sign = "-" if len(c) > 3 and c[3] == "-" else "+"
+                    self.sel.append((c[0], c[2].lower(), sign))
+                    self.sel_label[(c[0], c[2].lower())] = "%s %s / %s" % (sign, c[1] or c[0], c[2] or "(whole workspace)")
         self.patterns = []                 # (pattern, where it came from)
         if not a.no_ignore:
             for p in pattern_lines(os.path.join(a.config, "ignore")):
@@ -490,7 +496,7 @@ def folders_on_disk(root):
 def classify(rules, rows, want_refresh):
     have = folders_on_disk(rules.root)
     todo, ref, skipped = [], [], []
-    count = dict(total=0, have=0, nign=0, nonly=0)
+    count = dict(total=0, have=0, nign=0, nonly=0, nsel=0, outside=0)
     for wid, wname, pname, fid, fpath, fname in rows:
         fpath = "" if fpath in (".", None) else fpath
         fid = str(fid)
@@ -504,6 +510,7 @@ def classify(rules, rows, want_refresh):
             count["nonly"] += 1
             continue
         if rules.use_sel and not rules.sel_match(wid, "%s/%s" % (pname, inner))[0]:
+            count["nsel"] += 1
             continue
         if (rules.ignored(fname) or rules.ignored_path("%s/%s/%s" % (wname, pname, inner))
                 or any(rules.ignored(seg) for seg in fpath.split("/") if seg)):
@@ -516,6 +523,8 @@ def classify(rules, rows, want_refresh):
                 ref.append((fid, have[fid], wid))
             continue
         todo.append((fid, rules.target_dir(wid, wname, pname, fpath, fname, fid), wid))
+    # folders on disk in this scope that the rules above don't reach (excluded, or gone from the account)
+    count["outside"] = sum(1 for d in have.values() if rules.in_scope(d)) - count["have"]
     return todo, ref, skipped, count
 
 
@@ -621,6 +630,7 @@ def add_rule_args(p):
     p.add_argument("--scope-ws", default="")
     p.add_argument("--scope-proj", default="")
     p.add_argument("--refresh", action="store_true")
+    p.add_argument("--name", default="")
     p.add_argument("--check-account", action="store_true", help="refuse unless the signed-in account owns this mirror")
     p.add_argument("--offline", action="store_true", help="never ask the account; use the saved index")
     p.add_argument("--max-age", type=int, default=0, help="reuse listings newer than this many seconds")
@@ -631,6 +641,110 @@ def write_rows(path, rows):
     with open(path, "w", encoding="utf-8") as f:
         for r in rows:
             f.write("\t".join(clean(x) for x in r) + "\n")
+
+
+def explain(rules, index, have, a):
+    """Yield (heading, [reasons], verdict) for the workspaces, projects and files matching a.name."""
+    needle = a.name.lower()
+    ws_names = dict((str(w), n) for w, n in index.d["workspaces"])
+
+    def parent_checks(wid, wname, pname=None):
+        """Reasons a workspace (and project) is skipped; empty if it is in play."""
+        why = []
+        if rules.only_ws and str(wid) not in rules.only_ws:
+            why.append("not in the --workspace list")
+        if rules.scope_ws and str(wid) != rules.scope_ws:
+            why.append("outside the folder you are running in")
+        hit = rules.ignored(wname)
+        if hit:
+            why.append("workspace name matches ignore word '%s' (%s)" % hit)
+        if not rules.only_possible(wname):
+            why.append("excluded by --only")
+        if rules.use_sel and not rules.sel_ws_possible(wid):
+            why.append("no selection rule includes anything in this workspace")
+        if pname is not None and not why:
+            if rules.scope_proj and slug(pname) != rules.scope_proj:
+                why.append("outside the folder you are running in")
+            hit = rules.ignored(pname)
+            if hit:
+                why.append("project name matches ignore word '%s' (%s)" % hit)
+            if not rules.only_possible(wname, pname):
+                why.append("excluded by --only")
+            if rules.use_sel and not rules.sel_proj_possible(wid, pname):
+                why.append("no selection rule includes anything in this project")
+        return why
+
+    for wid, wname in index.d["workspaces"]:
+        if needle in wname.lower():
+            why = parent_checks(wid, wname)
+            yield ("workspace  %s" % wname, why or ["in play: its projects are checked one by one"],
+                   "skipped" if why else "included")
+    for wid, wname in index.d["workspaces"]:
+        for pid, pname in index.d["projects"].get(str(wid), {}).get("items", []):
+            if needle in pname.lower():
+                why = parent_checks(wid, wname, pname)
+                note = [] if why else ["in play: its files are checked one by one"]
+                if not why and str(pid) not in index.d["files"]:
+                    note = ["in play, but its files have not been listed yet: run 'rive-mirror fetch'"]
+                yield ("project    %s / %s" % (wname, pname), why or note, "skipped" if why else "included")
+    for wid, wname in index.d["workspaces"]:
+        for pid, pname in index.d["projects"].get(str(wid), {}).get("items", []):
+            for fid, fpath, fname in index.d["files"].get(str(pid), {}).get("rows", []):
+                inner = (fpath + "/" if fpath else "") + fname
+                if needle not in inner.lower():
+                    continue
+                label = "file       %s / %s / %s" % (wname, pname, inner)
+                why = parent_checks(wid, wname, pname)
+                if not why:
+                    path = "%s/%s" % (pname, inner)
+                    if not rules.only_match("%s/%s" % (wname, path)):
+                        why.append("excluded by --only")
+                    if rules.use_sel:
+                        inc, rule = rules.sel_match(wid, path)
+                        if not inc:
+                            why.append("selection rule '%s' excludes it" % rules.sel_label[(str(wid), rule)]
+                                       if rule is not None else "no selection rule covers it")
+                    hit = rules.ignored(fname) or rules.ignored_path("%s/%s/%s" % (wname, pname, inner))
+                    for seg in fpath.split("/"):
+                        hit = hit or (rules.ignored(seg) if seg else None)
+                    if hit:
+                        why.append("matches ignore word '%s' (%s)" % hit)
+                if why:
+                    yield (label, why, "skipped")
+                    continue
+                reasons = []
+                if rules.use_sel:
+                    inc, rule = rules.sel_match(wid, "%s/%s" % (pname, inner))
+                    reasons.append("covered by selection rule '%s'" % rules.sel_label[(str(wid), rule)])
+                where = have.get(str(fid))
+                if where:
+                    state = folder_state(where, os.path.join(rules.stamps, str(fid)))
+                    reasons.append("on disk: %s (%s)" % (os.path.relpath(where, rules.root), {
+                        "clean": "no local changes", "changed": "has local changes",
+                        "nobase": "no checksum recorded yet", "missing": "folder missing"}[state]))
+                else:
+                    reasons.append("not downloaded yet: the next run will download it")
+                yield (label, reasons, "included")
+
+
+def cmd_why(a):
+    rules, index = Rules(a), Index(a.local)
+    if not index.d["workspaces"]:
+        print("nothing saved yet: run 'rive-mirror fetch' first")
+        return
+    have = folders_on_disk(rules.root)
+    shown = 0
+    for heading, reasons, verdict in explain(rules, index, have, a):
+        if shown == 12:
+            print("... more matches; use a longer name to narrow it down")
+            break
+        shown += 1
+        print(heading)
+        for r in reasons:
+            print("  - " + r)
+        print("  => " + ("will be mirrored" if verdict == "included" else "skipped"))
+    if not shown:
+        print("nothing in the saved listing matches '%s' (listing is updated by 'rive-mirror fetch')" % a.name)
 
 
 def cmd_fetch(a):
@@ -660,18 +774,19 @@ def cmd_classify(a):
     write_rows(os.path.join(a.out, "ref.tsv"), ref)
     write_rows(os.path.join(a.out, "skipped.tsv"), skipped)
     with open(os.path.join(a.out, "summary.env"), "w") as f:
-        f.write("TOTAL=%d\nHAVE=%d\nNIGN=%d\nNONLY=%d\nNTODO=%d\n" % (
-            count["total"], count["have"], count["nign"], count["nonly"], len(todo)))
+        f.write("TOTAL=%d\nHAVE=%d\nNIGN=%d\nNONLY=%d\nNSEL=%d\nOUTSIDE=%d\nNTODO=%d\n" % (
+            count["total"], count["have"], count["nign"], count["nonly"], count["nsel"],
+            count["outside"], len(todo)))
 
 
 def cli(argv):
     if argv and argv[0] == "run":
         return cmd_run(argv[1:])
-    if argv and argv[0] in ("fetch", "classify"):
+    if argv and argv[0] in ("fetch", "classify", "why"):
         p = argparse.ArgumentParser(prog="rive-mirror-engine " + argv[0])
         add_rule_args(p)
         a = p.parse_args(argv[1:])
-        (cmd_fetch if argv[0] == "fetch" else cmd_classify)(a)
+        {"fetch": cmd_fetch, "classify": cmd_classify, "why": cmd_why}[argv[0]](a)
         return 0
     if argv and argv[0] == "account":
         p = argparse.ArgumentParser(prog="rive-mirror-engine account")
