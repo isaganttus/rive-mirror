@@ -30,6 +30,7 @@
 #   --only=WORD|PATH       this run only: just names matching it (repeatable), e.g.
 #                          --only=icons   or   --only='studio/main work/icons'
 #   --workspace=ID         only that workspace (repeatable; ids from `rive workspace`)
+#   --jobs=N               requests at a time (default 4, at most 8)
 #   --dry-run  --yes  --limit=N  --ignore=WORD  --no-ignore
 #
 # Speed: the account is listed several requests at a time, and the saved listing lets
@@ -221,6 +222,7 @@ while [ $# -gt 0 ]; do
     --all) ALL=1; EVERYTHING=1 ;;
     --workspace=*) ONLY="$ONLY${1#*=} " ;;
     --limit=*) LIMIT="${1#*=}" ;;
+    --jobs=*) export RIVE_MIRROR_JOBS="${1#*=}" ;;
     --ignore=*) CLI_PATTERNS="$CLI_PATTERNS${1#*=}"$'\n' ;;
     --no-ignore) NOIGN=1 ;;
     --no-check) NOCHECK=1 ;;
@@ -383,19 +385,10 @@ if [ "$REFRESH" = 1 ]; then
   if [ "$YES" = 0 ]; then
     [ -t 0 ] || { echo "no terminal to confirm on; pass --yes" >&2; exit 1; }
     echo "The Editor version wins: pull replaces scene, scripts and assets in these folders."
-    printf 'Pull %s folders (~4s each)? [y/N] ' "$nclean"; read -r a; [ "$a" = y ] || exit 0
+    printf 'Pull %s folders? [y/N] ' "$nclean"; read -r a; [ "$a" = y ] || exit 0
   fi
-  i=0; upd=0; same=0; failed=0
-  while IFS=$'\t' read -r fid dir wid; do
-    i=$((i+1)); printf '[%s/%s] %s ' "$i" "$nclean" "${dir#$ROOT/}"
-    before=$(stamp_sum "$fid")
-    if rive pull "$dir" --yes --quiet >"$TMP/out.log" 2>&1; then
-      stamp_set "$fid" "$dir"
-      if [ "$(stamp_sum "$fid")" = "$before" ]; then same=$((same+1)); echo "(same)"; else upd=$((upd+1)); echo "(updated)"; fi
-    else
-      failed=$((failed+1)); echo "FAILED: $(tail -1 "$TMP/out.log")"
-    fi
-  done < "$CLEAN"
+  python3 -I "$ENGINE" run pull --root "$ROOT" --stamps "$STAMPS" --result "$TMP/run.env" < "$CLEAN" || exit $?
+  . "$TMP/run.env"; upd=$UPDATED; same=$SAME; failed=$FAILED
   echo "done: $upd updated, $same already current, $failed failed"
   [ "$failed" = 0 ] || echo "(failed folders keep their old baseline; if pull wrote part of them they will show as changed)"
   exit 0
@@ -414,20 +407,12 @@ if [ "$DRY" = 1 ]; then cut -f2 "$TODO" | sed "s|^$ROOT/||"; exit 0; fi
 
 if [ "$YES" = 0 ]; then
   [ -t 0 ] || { echo "no terminal to confirm on; pass --yes" >&2; exit 1; }
-  printf 'Download %s files (~4s each)? [y/N] ' "$n"; read -r a; [ "$a" = y ] || exit 0
+  printf 'Download %s files? [y/N] ' "$n"; read -r a; [ "$a" = y ] || exit 0
 fi
 
-# 3. Download.
-i=0; failed=0
-while IFS=$'\t' read -r fid dir wid; do
-  i=$((i+1)); echo "[$i/$n] ${dir#$ROOT/}"
-  mkdir -p "$(dirname "$dir")"
-  if ! rive create "$dir" --from-remote-file="$fid" >"$TMP/out.log" 2>&1; then
-    failed=$((failed+1)); echo "   FAILED: $(tail -1 "$TMP/out.log")"; rm -rf "$dir"
-  else
-    stamp_set "$fid" "$dir"
-  fi
-done < "$TODO"
+# 3. Download, several at a time.
+python3 -I "$ENGINE" run create --root "$ROOT" --stamps "$STAMPS" --result "$TMP/run.env" < "$TODO" || exit $?
+. "$TMP/run.env"; failed=$FAILED
 
 echo "done: $((n-failed)) downloaded, $failed failed"
 echo "Reminder: 'rive push' inside any of these folders overwrites its Editor file."

@@ -106,6 +106,17 @@ has "a failed listing warns" "warning: could not list project 51" "$out"
 has "and falls back to the saved listing" "7 files visible" "$out"
 rm "$D/lsfail_51" "$D/files_52.jsonl"; sed -i.bak '/"Extra"/d' "$D/projects_5.jsonl"; run --dry-run --no-check >/dev/null
 
+# downloads run several at a time; a file that can't be converted is reported and leaves nothing behind
+printf '%s\n' '{"kind":"project","projectId":53,"name":"Odd"}' >> "$D/projects_5.jsonl"
+printf '%s\n' '{"kind":"file","fileId":8,"path":"","name":"Broken"}' '{"kind":"file","fileId":9,"path":"","name":"Fine"}' > "$D/files_53.jsonl"
+echo v1-8 > "$D/remote_8"; echo v1-9 > "$D/remote_9"; touch "$D/createfail_8"
+out=$(run --yes --jobs=3 --no-check)
+has "a failed download is reported" "FAILED: cannot be written as markup" "$out"
+has "and counted, while the others finish" "done: 1 downloaded, 1 failed" "$out"
+[ ! -e studio-5/odd/broken-8 ] && has "a failed download leaves no partial folder" ok ok || has "a failed download leaves no partial folder" ok left-behind
+[ -f studio-5/odd/fine-9/rive.yaml ] && has "the next file still downloads" ok ok || has "the next file still downloads" ok missing
+rm "$D/createfail_8" "$D/files_53.jsonl"; sed -i.bak '/"Odd"/d' "$D/projects_5.jsonl"; rm -rf studio-5/odd; run --dry-run --no-check >/dev/null
+
 # --- change detection (the engine) ---
 E="$HERE/../rive-mirror-engine.py"
 mkdir -p "$T/sum/sub dir" "$T/sum/.git"; echo a > "$T/sum/one.txt"; echo b > "$T/sum/sub dir/two txt"

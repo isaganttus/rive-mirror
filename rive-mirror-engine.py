@@ -20,6 +20,10 @@ Listing your account
   The account is listed in parallel and the answers are kept in
   <mirror>/.rive-mirror/index.json, so commands that only look can answer from disk.
 
+  run create|pull --root R --stamps S --result FILE < rows
+                               run `rive create` / `rive pull` for each "fid TAB dir TAB wid"
+                               row, several at a time, saving each folder's state afterwards
+
   fetch   [rules] --out DIR    list what is needed (or just read the saved index with
                                --offline) and write DIR/plan.tsv, one row per file
   classify [rules] --out DIR   apply selection, ignore words, --only and scope to plan.tsv;
@@ -32,10 +36,11 @@ import json
 import os
 import re
 import stat
+import shutil
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # ---- change tracking -----------------------------------------------------
@@ -514,6 +519,83 @@ def classify(rules, rows, want_refresh):
     return todo, ref, skipped, count
 
 
+# ---- running create / pull -------------------------------------------------
+
+def last_line(text):
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    return lines[-1] if lines else "no output"
+
+
+def run_one(kind, root, stamps, fid, folder, inflight):
+    """One create or pull. Returns (ok, note)."""
+    env = dict(os.environ, RIVE_NO_TUI="1")
+    if kind == "create":
+        os.makedirs(os.path.dirname(folder), exist_ok=True)
+        inflight.add(folder)
+        r = subprocess.run(["rive", "create", folder, "--from-remote-file=%s" % fid],
+                           capture_output=True, text=True, env=env)
+        inflight.discard(folder)
+        if r.returncode != 0:
+            shutil.rmtree(folder, ignore_errors=True)    # never leave a half-written copy
+            return False, last_line(r.stdout + r.stderr)
+        record(os.path.join(stamps, fid), folder)
+        return True, ""
+    before = (read_stamp(os.path.join(stamps, fid)) or ("", None))[0]
+    r = subprocess.run(["rive", "pull", folder, "--yes", "--quiet"], capture_output=True, text=True, env=env)
+    if r.returncode != 0:
+        return False, last_line(r.stdout + r.stderr)
+    record(os.path.join(stamps, fid), folder)
+    return True, "same" if (read_stamp(os.path.join(stamps, fid)) or ("",))[0] == before else "updated"
+
+
+def cmd_run(argv):
+    p = argparse.ArgumentParser(prog="rive-mirror-engine run")
+    p.add_argument("kind", choices=["create", "pull"])
+    p.add_argument("--root", required=True)
+    p.add_argument("--stamps", required=True)
+    p.add_argument("--result", required=True)
+    p.add_argument("--jobs", type=int, default=int(os.environ.get("RIVE_MIRROR_JOBS") or 4))
+    a = p.parse_args(argv)
+    rows = [l.rstrip("\n").split("\t") for l in sys.stdin if l.strip()]
+    rows = [r for r in rows if len(r) >= 3]
+    n, done, failed, updated, same = len(rows), 0, 0, 0, 0
+    inflight = set()
+    ex = ThreadPoolExecutor(max_workers=max(1, min(a.jobs, 8)))
+    try:
+        futures = {ex.submit(run_one, a.kind, a.root, a.stamps, r[0], r[1], inflight): r for r in rows}
+        for fut in as_completed(futures):
+            fid, folder = futures[fut][0], futures[fut][1]
+            rel = os.path.relpath(folder, a.root)
+            done += 1
+            try:
+                ok, note = fut.result()
+            except OSError as e:
+                ok, note = False, str(e)
+            if ok:
+                if a.kind == "pull":
+                    updated, same = updated + (note == "updated"), same + (note == "same")
+                    print("[%d/%d] %s (%s)" % (done, n, rel, note), flush=True)
+                else:
+                    print("[%d/%d] %s" % (done, n, rel), flush=True)
+            else:
+                failed += 1
+                if a.kind == "pull":
+                    print("[%d/%d] %s FAILED: %s" % (done, n, rel, note), flush=True)
+                else:
+                    print("[%d/%d] %s\n   FAILED: %s" % (done, n, rel, note), flush=True)
+    except KeyboardInterrupt:
+        ex.shutdown(wait=False, cancel_futures=True)
+        for folder in list(inflight):                    # unfinished downloads leave nothing behind
+            shutil.rmtree(folder, ignore_errors=True)
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+    finally:
+        ex.shutdown(wait=True)
+    with open(a.result, "w") as f:
+        f.write("TOTAL=%d\nFAILED=%d\nUPDATED=%d\nSAME=%d\n" % (n, failed, updated, same))
+    return 0
+
+
 # ---- command line ---------------------------------------------------------
 
 def cmd_state(stamps):
@@ -583,6 +665,8 @@ def cmd_classify(a):
 
 
 def cli(argv):
+    if argv and argv[0] == "run":
+        return cmd_run(argv[1:])
     if argv and argv[0] in ("fetch", "classify"):
         p = argparse.ArgumentParser(prog="rive-mirror-engine " + argv[0])
         add_rule_args(p)

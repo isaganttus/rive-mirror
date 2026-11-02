@@ -4,6 +4,7 @@
 #   workspaces.jsonl, projects_<workspaceId>.jsonl, files_<projectId>.jsonl  what `ls` returns
 #   remote_<fileId>      the file's content in the "Editor"
 #   pullfail_<fileId>    if present, `rive pull` fails for that file
+#   createfail_<fileId>  if present, `rive create` leaves a partial folder and fails
 #   lsfail_<projectId>   if present, listing that project's files fails
 #   calls.log            every call, one per line
 D="$FAKE_DATA"
@@ -13,6 +14,7 @@ case "$1" in
   workspace) [ "${2:-}" = --json ] && cat "$D/workspaces.jsonl"; exit 0 ;;
   create) dir="$2"; fid=""
           for a in "$@"; do case "$a" in --from-remote-file=*) fid=${a#*=} ;; esac; done
+          [ -f "$D/createfail_$fid" ] && { mkdir -p "$dir"; echo "cannot be written as markup" >&2; exit 1; }
           mkdir -p "$dir"; cat "$D/remote_$fid" > "$dir/scene.rml"
           printf 'name: x\npush:\n  projectId: 0\n  fileId: %s\n' "$fid" > "$dir/rive.yaml"; exit 0 ;;
   pull) dir="$2"; fid=$(awk '/fileId:/{print $2}' "$dir/rive.yaml")
