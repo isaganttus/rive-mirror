@@ -146,6 +146,12 @@ rm .rive-mirror/selection
 out=$(run refresh --dry-run); has "refresh works as a command" "mirrored folders in scope" "$out"
 out=$(run sync --dry-run --no-check); has "sync works as a command" "files visible" "$out"
 
+# --- help and mistakes ---
+out=$(run --help); eq "help has no comment markers" "rive-mirror: keep local copies of the Rive files you can open. Works like git: a folder" "$(printf '%s\n' "$out" | head -n 1)"
+out=$(run bogus); has "a misspelled command is called one" "unknown command 'bogus'" "$out"
+out=$(run --bogus); has "a misspelled option is called one" "unknown option: --bogus" "$out"
+out=$(run -n --no-check); has "-n is --dry-run" "files visible" "$out"
+
 # --- change detection (the engine) ---
 E="$HERE/../rive-mirror-engine.py"
 mkdir -p "$T/sum/sub dir" "$T/sum/.git"; echo a > "$T/sum/one.txt"; echo b > "$T/sum/sub dir/two txt"

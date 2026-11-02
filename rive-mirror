@@ -35,7 +35,7 @@
 #                          --only=icons   or   --only='studio/main work/icons'
 #   --workspace=ID         only that workspace (repeatable; ids from `rive workspace`)
 #   --jobs=N               requests at a time (default 4, at most 8)
-#   --dry-run  --yes  --limit=N  --ignore=WORD  --no-ignore
+#   --dry-run (-n)  --yes (-y)  --limit=N  --ignore=WORD  --no-ignore
 #
 # Speed: the account is listed several requests at a time, and the saved listing lets
 # commands that only look answer from disk. No command switches your Rive CLI workspace.
@@ -228,7 +228,7 @@ DRY=0; YES=0; ALL=0; EVERYTHING=0; NOCHECK=0; LIMIT=0; ONLY=" "; NOIGN=0; CLI_PA
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --dry-run) DRY=1 ;;
+    --dry-run|-n) DRY=1 ;;
     --yes|-y) YES=1 ;;
     --all) ALL=1; EVERYTHING=1 ;;
     --workspace=*) ONLY="$ONLY${1#*=} " ;;
@@ -242,8 +242,9 @@ while [ $# -gt 0 ]; do
     --baseline) BASELINE=1 ;;
     --baseline=changed) BASELINE=2 ;;
     --only=*) ONLY_RAW="$ONLY_RAW${1#*=}"$'\n'; ALL=1 ;;
-    -h|--help) awk 'NR>1 && /^#/{print; next} NR>1{exit}' "$0"; exit 0 ;;
-    *) echo "unknown option: $1" >&2; exit 2 ;;
+    -h|--help) awk 'NR>1 && /^#/{sub(/^# ?/, ""); print; next} NR>1{exit}' "$0"; exit 0 ;;
+    -*) echo "unknown option: $1   (rive-mirror --help)" >&2; exit 2 ;;
+    *) echo "unknown command '$1'   (rive-mirror --help)" >&2; exit 2 ;;
   esac
   shift
 done
