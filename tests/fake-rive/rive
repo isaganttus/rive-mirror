@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# A stand-in for the `rive` CLI, just enough for rive-mirror's tests. Reads canned
+# answers from $FAKE_DATA; never touches a network or an account.
+#   workspaces.jsonl, projects_<workspaceId>.jsonl, files_<projectId>.jsonl  what `ls` returns
+#   remote_<fileId>      the file's content in the "Editor"
+#   pullfail_<fileId>    if present, `rive pull` fails for that file
+D="$FAKE_DATA"
+case "$1" in
+  whoami) echo "${FAKE_USER:-alice} alice@example.com"; echo "workspace: Studio (5)"; exit 0 ;;
+  workspace) [ "${2:-}" = --json ] && cat "$D/workspaces.jsonl"; exit 0 ;;
+  create) dir="$2"; fid=""
+          for a in "$@"; do case "$a" in --from-remote-file=*) fid=${a#*=} ;; esac; done
+          mkdir -p "$dir"; cat "$D/remote_$fid" > "$dir/scene.rml"
+          printf 'name: x\npush:\n  projectId: 0\n  fileId: %s\n' "$fid" > "$dir/rive.yaml"; exit 0 ;;
+  pull) dir="$2"; fid=$(awk '/fileId:/{print $2}' "$dir/rive.yaml")
+        [ -f "$D/pullfail_$fid" ] && { echo "pull failed" >&2; exit 1; }
+        cat "$D/remote_$fid" > "$dir/scene.rml"; exit 0 ;;
+  ls) shift; pid=""; ws=""
+      for a in "$@"; do case "$a" in --workspace=*) ws=${a#*=} ;; --json|--all) ;; *) pid=$a ;; esac; done
+      if [ -z "$pid" ]; then cat "$D/projects_$ws.jsonl" 2>/dev/null; else cat "$D/files_$pid.jsonl" 2>/dev/null; fi
+      exit 0 ;;
+esac
+exit 0
