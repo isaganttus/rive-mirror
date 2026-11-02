@@ -1,0 +1,6 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# a mirror made by rive-mirror holds your account's files; never commit one
+.rive-mirror/
