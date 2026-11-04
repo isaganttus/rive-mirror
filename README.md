@@ -33,6 +33,8 @@ rive-mirror select        # tick the workspaces, projects and folders you want
 rive-mirror               # download what is missing
 ```
 
+![rive-mirror select in a terminal, with the projects of a workspace listed and the four folders of one project ticked, next to a Finder window showing those four folders downloaded into the mirror](docs/select.png)
+
 Later:
 
 ```sh
