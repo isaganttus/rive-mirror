@@ -57,6 +57,7 @@ rive-mirror -n            # see what would be downloaded, change nothing
 | `fetch` | List your account and save the answer (`.rive-mirror/index.json`). Downloads nothing. |
 | `ignore [add W.. \| rm W \| edit]` | Skip names containing a word. Local to this mirror by default; `--global` applies to every mirror. |
 | `root` | Print the mirror you are in. |
+| `move DEST` | Move this mirror, like `mv`: into `DEST` if it is an existing folder, otherwise renamed to `DEST`. Nothing is downloaded again and edits stay recorded as edits. Refuses to move into another mirror or a downloaded file folder, or while a run is going. `-n` shows where it would go. |
 | `-C PATH` | Run as if started in `PATH`. |
 
 Options: `--all` (ignore the saved rules for this run), `--only=WORD|PATH`, `--workspace=ID`, `--dry-run` / `-n`, `--offline` (with `--dry-run`: use the saved listing), `--yes` / `-y`, `--limit=N`, `--jobs=N`, `--ignore=WORD`, `--no-ignore`.

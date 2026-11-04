@@ -152,6 +152,25 @@ out=$(run bogus); has "a misspelled command is called one" "unknown command 'bog
 out=$(run --bogus); has "a misspelled option is called one" "unknown option: --bogus" "$out"
 out=$(run -n --no-check); has "-n is --dry-run" "files visible" "$out"
 
+# --- move: the mirror keeps working from its new place ---
+cd "$T"; mkdir -p "$T/dest"
+out=$(cd mirror && run move "$T/dest" -n); has "move -n says where it would go" "to $T/dest/mirror" "$out"
+[ -d mirror/.rive-mirror ] && has "move -n changes nothing" ok ok || has "move -n changes nothing" ok moved
+out=$(cd mirror && run move "$T/mirror/studio-5"); has "move refuses to go inside itself" "into itself" "$out"
+mkdir -p "$T/other"; (cd "$T/other" && run init >/dev/null)
+out=$(cd mirror && run move "$T/other"); has "move refuses to nest in another mirror" "can't be nested" "$out"
+out=$(cd mirror && run move "$T/filefolder"); has "move refuses a file folder" "downloaded file folder" "$out"
+out=$(cd mirror && run move "$T/nowhere/deeper"); has "move needs the parent to exist" "no such folder" "$out"
+out=$(cd mirror/studio-5 && run move "$T/dest"); has "move works from a subfolder" "to $T/dest/mirror" "$out"
+grep -qxF "$T/dest/mirror" "$XDG_CONFIG_HOME/rive-mirror/roots" && has "move lists the new place" ok ok || has "move lists the new place" ok missing
+grep -qxF "$T/mirror" "$XDG_CONFIG_HOME/rive-mirror/roots" && has "move forgets the old place" ok listed || has "move forgets the old place" ok ok
+cd "$T/dest/mirror"
+out=$(run --dry-run --no-check); has "a moved mirror has nothing to download" "already mirrored, 0 to download" "$out"
+out=$(run --refresh --dry-run); has "a moved mirror's folders are still unchanged" "1 with local changes" "$out"
+out=$(run move "$T/renamed"); has "move can rename" "to $T/renamed" "$out"
+mkdir "$T/dest/renamed"; cd "$T/renamed"
+out=$(run move "$T/dest"); has "move refuses an existing target" "already exists" "$out"
+
 # --- change detection (the engine) ---
 E="$HERE/../rive-mirror-engine.py"
 mkdir -p "$T/sum/sub dir" "$T/sum/.git"; echo a > "$T/sum/one.txt"; echo b > "$T/sum/sub dir/two txt"

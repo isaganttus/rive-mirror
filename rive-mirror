@@ -26,6 +26,8 @@
 #   rive-mirror --refresh --baseline=changed   after you've pushed edited folders: record the ones
 #                                  with local changes as current again (use with --only)
 #   rive-mirror root               print the mirror you are in
+#   rive-mirror move DEST [-n]     move this mirror, like mv (into DEST if it is a folder, else
+#                                  renamed to DEST); nothing is downloaded again
 #   rive-mirror ignore [add W..|rm W|edit] [--global]   skip names containing a word (like .gitignore)
 #                                  local (this mirror) by default; --global applies to every mirror
 #   rive-mirror -C PATH ...        run as if started in PATH (like git -C)
@@ -170,6 +172,50 @@ fi
 if [ "${1:-}" = root ] || [ "${1:-}" = dir ]; then
   if [ "${2:-}" != "" ]; then echo "there is no saved directory any more; use 'rive-mirror init PATH'." >&2; exit 2; fi
   if [ -n "$ROOT" ]; then echo "$ROOT"; else echo "not inside a rive-mirror folder" >&2; exit 1; fi
+  exit 0
+fi
+
+# rive-mirror move DEST [-n]: move the whole mirror, like mv. Into DEST when it is an existing
+# folder, otherwise renamed to DEST. Nothing inside a mirror records where it is, so only the
+# list of known mirrors needs updating; nothing is downloaded again.
+if [ "${1:-}" = move ]; then
+  dest=""; dry=0
+  for a in "${@:2}"; do
+    case "$a" in
+      -n|--dry-run) dry=1 ;;
+      -*) echo "unknown option: $a   (usage: rive-mirror move DEST [-n])" >&2; exit 2 ;;
+      *) [ -z "$dest" ] || { echo "usage: rive-mirror move DEST [-n]" >&2; exit 2; }; dest=$(norm "$a") ;;
+    esac
+  done
+  [ -n "$dest" ] || { echo "usage: rive-mirror move DEST [-n]" >&2; exit 2; }
+  need_root
+  if [ -d "$dest" ]; then dest="$(cd "$dest" && pwd -P)/$(basename "$ROOT")"
+  else
+    parent=$(dirname "$dest")
+    [ -d "$parent" ] || { echo "no such folder: $parent" >&2; exit 2; }
+    dest="$(cd "$parent" && pwd -P)/$(basename "$dest")"
+  fi
+  [ ! -e "$dest" ] || { echo "already exists: $dest" >&2; exit 2; }
+  case "$dest/" in "$ROOT"/*) echo "can't move the mirror into itself ($ROOT)" >&2; exit 2 ;; esac
+  if [ "$dest" = "$HOME" ] || [ "$dest" = / ]; then echo "Not moving a mirror to $dest." >&2; exit 2; fi
+  d=$(dirname "$dest")
+  while :; do
+    [ ! -d "$d/.rive-mirror" ] || { echo "$dest would be inside the mirror at $d; mirrors can't be nested." >&2; exit 2; }
+    [ ! -f "$d/rive.yaml" ] || { echo "$dest would be inside a downloaded file folder ($d); pick a folder above it." >&2; exit 2; }
+    [ "$d" = / ] && break; d=$(dirname "$d")
+  done
+  pid=$(cat "$LOCAL/lock/pid" 2>/dev/null || true)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    echo "another rive-mirror (pid $pid) is running in this mirror; wait for it to finish." >&2; exit 4
+  fi
+  if [ "$dry" = 1 ]; then echo "would move $ROOT"; echo "        to $dest"; exit 0; fi
+  mv "$ROOT" "$dest" || { echo "move failed; the mirror is still at $ROOT" >&2; exit 1; }
+  mkdir -p "$GLOBAL"
+  { [ ! -f "$GLOBAL/roots" ] || grep -vxF -- "$ROOT" "$GLOBAL/roots" || true; printf '%s\n' "$dest"; } > "$GLOBAL/roots.tmp"
+  awk '!seen[$0]++' "$GLOBAL/roots.tmp" > "$GLOBAL/roots"; rm -f "$GLOBAL/roots.tmp"
+  echo "moved $ROOT"
+  echo "   to $dest"
+  echo "(your shell is still in the old place: cd \"$dest\")"
   exit 0
 fi
 
